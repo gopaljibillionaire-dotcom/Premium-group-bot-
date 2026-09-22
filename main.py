@@ -1,13 +1,44 @@
-import asyncio
-import datetime
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+"""
+Production Telegram Pack Bot
+Python 3.11+
+aiogram 3.x + Motor + MongoDB + FastAPI + OxaPay
 
-import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router, html
+Everything is intentionally contained in this one file.
+
+Before running:
+1. Replace BOT_TOKEN / MONGO_URI / ADMIN_IDS / CHANNEL_ID.
+2. Configure OxaPay API key.
+3. Configure a public HTTPS OxaPay webhook URL.
+4. Add the bot to the authorized source channel with sufficient permissions.
+"""
+
+import os
+import re
+import hmac
+import hashlib
+import logging
+import asyncio
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
+from typing import Optional, Any
+
+import aiohttp
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
+import uvicorn
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
+from pymongo.errors import PyMongoError
+
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,1328 +51,4295 @@ from aiogram.types import (
     Message,
     PreCheckoutQuery,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import BOT_TOKEN, ADMIN_IDS, CHANNEL_ID, DB_FILE, CHECK_INTERVAL, WALLETS, logger
 
-# =============================================================================
-# 1. FSM STATES
-# =============================================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-class AdminPlanStates(StatesGroup):
-    waiting_name = State()
-    waiting_price = State()
-    waiting_currency = State()
-    waiting_duration_val = State()
-    waiting_duration_unit = State()
-    waiting_description = State()
-    confirmation = State()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8925435092:AAGQzPGeIoCq91T_IkP2GSAsiHUdrChwxVw")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://Gopaljichoubey:gopaljichoubey12@cluster0.qlsuf4o.mongodb.net/?appName=Cluster0")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "pack_bot")
 
-class AdminBulkInviteStates(StatesGroup):
-    waiting_links = State()
+ADMIN_IDS = [
+    7952327997
+]
 
-class UserPaymentProofStates(StatesGroup):
-    waiting_proof = State()
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004391777541"))
 
-class BroadcastStates(StatesGroup):
-    waiting_message = State()
-    confirmation = State()
+OXAPAY_MERCHANT_API_KEY = os.getenv(
+    "OXAPAY_MERCHANT_API_KEY",
+    "YOUR_OXAPAY_API_KEY",
+)
 
-class AdminUserSearchStates(StatesGroup):
-    waiting_query = State()
+# Public HTTPS endpoint, e.g.
+# https://your-domain.com/webhook/oxapay
+OXAPAY_WEBHOOK_URL = os.getenv(
+    "OXAPAY_WEBHOOK_URL",
+    "https://YOUR_DOMAIN/webhook/oxapay",
+)
 
-# =============================================================================
-# 2. DATABASE MANAGER
-# =============================================================================
+UPI_ID = os.getenv("UPI_ID", "yourupi@upi")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "your_admin_username")
 
-class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+STAR_TO_INR_RATE = float(os.getenv("STAR_TO_INR_RATE", "1.5"))
 
-    async def init_db(self):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA foreign_keys = ON;")
-            
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE NOT NULL,
-                username TEXT,
-                first_name TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL,
-                updated_at TIMESTAMP NOT NULL,
-                is_blocked INTEGER DEFAULT 0
-            );
-            """)
+# OxaPay default v1 API.
+OXAPAY_API_BASE = "https://api.oxapay.com/v1"
 
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS plans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                price REAL NOT NULL,
-                currency TEXT NOT NULL,
-                duration_value INTEGER NOT NULL,
-                duration_unit TEXT NOT NULL,
-                duration_seconds INTEGER NOT NULL,
-                description TEXT,
-                active INTEGER DEFAULT 1,
-                created_at TIMESTAMP NOT NULL,
-                updated_at TIMESTAMP NOT NULL
-            );
-            """)
+# How much USD/USDT is credited per dollar paid.
+# For a real production service, make these rates configurable
+# from the admin panel or an external price source.
+USDT_TO_INR_RATE = float(os.getenv("USDT_TO_INR_RATE", "90"))
 
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                plan_id INTEGER NOT NULL,
-                started_at TIMESTAMP NOT NULL,
-                expires_at TIMESTAMP NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL,
-                updated_at TIMESTAMP NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (telegram_id) ON DELETE CASCADE,
-                FOREIGN KEY (plan_id) REFERENCES plans (id) ON DELETE CASCADE
-            );
-            """)
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
 
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                plan_id INTEGER NOT NULL,
-                provider_payment_id TEXT UNIQUE NOT NULL,
-                amount REAL NOT NULL,
-                currency TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL,
-                paid_at TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (telegram_id) ON DELETE CASCADE,
-                FOREIGN KEY (plan_id) REFERENCES plans (id) ON DELETE CASCADE
-            );
-            """)
 
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS invite_links_pool (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                invite_link TEXT UNIQUE NOT NULL,
-                is_used INTEGER DEFAULT 0,
-                created_at TIMESTAMP NOT NULL
-            );
-            """)
+# ============================================================
+# LOGGING
+# ============================================================
 
-            await db.commit()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
-    async def upsert_user(self, telegram_id: int, username: Optional[str], first_name: str) -> None:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-            INSERT INTO users (telegram_id, username, first_name, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                updated_at = excluded.updated_at
-            """, (telegram_id, username, first_name, now, now))
-            await db.commit()
+logger = logging.getLogger("pack_bot")
 
-    async def get_user(self, telegram_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
 
-    async def add_bulk_invites(self, links: List[str]) -> int:
-        now = datetime.now(timezone.utc)
-        added = 0
-        async with aiosqlite.connect(self.db_path) as db:
-            for link in links:
-                try:
-                    await db.execute(
-                        "INSERT INTO invite_links_pool (invite_link, is_used, created_at) VALUES (?, 0, ?)",
-                        (link.strip(), now)
-                    )
-                    added += 1
-                except Exception:
-                    continue
-            await db.commit()
-        return added
+# ============================================================
+# GLOBALS
+# ============================================================
 
-    async def get_available_invite(self) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM invite_links_pool WHERE is_used = 0 LIMIT 1") as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+mongo_client: Optional[AsyncIOMotorClient] = None
+db = None
 
-    async def mark_invite_used(self, link_id: int) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM invite_links_pool WHERE id = ?", (link_id,))
-            await db.commit()
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 
-    async def get_all_user_ids(self) -> List[int]:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT telegram_id FROM users WHERE is_blocked = 0") as cursor:
-                rows = await cursor.fetchall()
-                return [r[0] for r in rows]
-
-    async def create_plan(self, name: str, price: float, currency: str,
-                          duration_val: int, duration_unit: str, duration_sec: int,
-                          description: str) -> int:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-            INSERT INTO plans (name, price, currency, duration_value, duration_unit, duration_seconds, description, active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-            """, (name, price, currency.upper(), duration_val, duration_unit, duration_sec, description, now, now))
-            await db.commit()
-            return cursor.lastrowid
-
-    async def get_active_plans(self) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM plans WHERE active = 1 ORDER BY price ASC") as cursor:
-                rows = await cursor.fetchall()
-                return [dict(r) for r in rows]
-
-    async def get_all_plans(self) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM plans ORDER BY id DESC") as cursor:
-                rows = await cursor.fetchall()
-                return [dict(r) for r in rows]
-
-    async def get_plan(self, plan_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
-
-    async def toggle_plan_status(self, plan_id: int) -> None:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-            UPDATE plans SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END, updated_at = ?
-            WHERE id = ?
-            """, (now, plan_id))
-            await db.commit()
-
-    async def delete_plan(self, plan_id: int) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
-            await db.commit()
-
-    async def get_active_subscription(self, telegram_id: int) -> Optional[Dict[str, Any]]:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("""
-            SELECT s.*, p.name as plan_name 
-            FROM subscriptions s
-            JOIN plans p ON s.plan_id = p.id
-            WHERE s.user_id = ? AND s.status = 'active' AND s.expires_at > ?
-            ORDER BY s.expires_at DESC LIMIT 1
-            """, (telegram_id, now)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
-
-    async def add_or_extend_subscription(self, telegram_id: int, plan_id: int, duration_seconds: int) -> Dict[str, Any]:
-        now = datetime.now(timezone.utc)
-        active_sub = await self.get_active_subscription(telegram_id)
-
-        if active_sub:
-            curr_expires = active_sub['expires_at']
-            if isinstance(curr_expires, str):
-                curr_expires = datetime.fromisoformat(curr_expires)
-            if curr_expires.tzinfo is None:
-                curr_expires = curr_expires.replace(tzinfo=timezone.utc)
-            
-            start_time = active_sub['started_at']
-            expires_time = curr_expires + timedelta(seconds=duration_seconds)
-            
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("UPDATE subscriptions SET status = 'extended', updated_at = ? WHERE id = ?", (now, active_sub['id']))
-                await db.commit()
-        else:
-            start_time = now
-            expires_time = now + timedelta(seconds=duration_seconds)
-
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
-            INSERT INTO subscriptions (user_id, plan_id, started_at, expires_at, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'active', ?, ?)
-            """, (telegram_id, plan_id, start_time, expires_time, now, now))
-            sub_id = cursor.lastrowid
-            await db.commit()
-            
-            async with db.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)) as c:
-                row = await c.fetchone()
-                return dict(row)
-
-    async def get_expired_subscriptions(self) -> List[Dict[str, Any]]:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("""
-            SELECT s.*, u.telegram_id 
-            FROM subscriptions s
-            JOIN users u ON s.user_id = u.telegram_id
-            WHERE s.status = 'active' AND s.expires_at <= ?
-            """, (now,)) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(r) for r in rows]
-
-    async def mark_subscription_expired(self, sub_id: int) -> None:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE subscriptions SET status = 'expired', updated_at = ? WHERE id = ?", (now, sub_id))
-            await db.commit()
-
-    async def revoke_user_subscriptions(self, telegram_id: int) -> None:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE subscriptions SET status = 'revoked', updated_at = ? WHERE user_id = ? AND status = 'active'", (now, telegram_id))
-            await db.commit()
-
-    async def create_payment_record(self, user_id: int, plan_id: int, provider_payment_id: str, amount: float, currency: str) -> int:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-            INSERT INTO payments (user_id, plan_id, provider_payment_id, amount, currency, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?)
-            """, (user_id, plan_id, provider_payment_id, amount, currency.upper(), now))
-            await db.commit()
-            return cursor.lastrowid
-
-    async def get_payment_by_provider_id(self, provider_payment_id: str) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM payments WHERE provider_payment_id = ?", (provider_payment_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
-
-    async def update_payment_status(self, provider_payment_id: str, status: str) -> None:
-        now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
-            if status == 'paid':
-                await db.execute("UPDATE payments SET status = ?, paid_at = ? WHERE provider_payment_id = ?", (status, now, provider_payment_id))
-            else:
-                await db.execute("UPDATE payments SET status = ? WHERE provider_payment_id = ?", (status, provider_payment_id))
-            await db.commit()
-
-    async def get_user_payments(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("""
-            SELECT p.*, pl.name as plan_name 
-            FROM payments p
-            LEFT JOIN plans pl ON p.plan_id = pl.id
-            WHERE p.user_id = ? 
-            ORDER BY p.created_at DESC LIMIT ?
-            """, (user_id, limit)) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(r) for r in rows]
-
-    async def get_stats(self) -> Dict[str, Any]:
-        now = datetime.now(timezone.utc)
-        today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT COUNT(*) FROM users") as c:
-                total_users = (await c.fetchone())[0]
-
-            async with db.execute("SELECT COUNT(*) FROM subscriptions WHERE status = 'active' AND expires_at > ?", (now,)) as c:
-                active_subs = (await c.fetchone())[0]
-
-            async with db.execute("SELECT COUNT(*) FROM subscriptions WHERE status = 'expired' OR expires_at <= ?", (now,)) as c:
-                expired_subs = (await c.fetchone())[0]
-
-            async with db.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payments WHERE status = 'paid'") as c:
-                row = await c.fetchone()
-                total_payments, total_revenue = row[0], row[1]
-
-            async with db.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payments WHERE status = 'paid' AND paid_at >= ?", (today_start,)) as c:
-                row = await c.fetchone()
-                today_payments, today_revenue = row[0], row[1]
-
-            async with db.execute("SELECT COUNT(*) FROM plans WHERE active = 1") as c:
-                total_plans = (await c.fetchone())[0]
-
-            async with db.execute("SELECT COUNT(*) FROM invite_links_pool WHERE is_used = 0") as c:
-                pool_links = (await c.fetchone())[0]
-
-            return {
-                "total_users": total_users,
-                "active_subs": active_subs,
-                "expired_subs": expired_subs,
-                "total_payments": total_payments,
-                "total_revenue": total_revenue,
-                "today_payments": today_payments,
-                "today_revenue": today_revenue,
-                "total_plans": total_plans,
-                "pool_links": pool_links,
-            }
-
-db = Database(DB_FILE)
-
-# =============================================================================
-# 3. HELPERS & KEYBOARDS
-# =============================================================================
-
-async def grant_subscription_and_send_link(bot: Bot, user_id: int, plan: Dict[str, Any], provider_tx_id: str) -> bool:
-    await db.update_payment_status(provider_tx_id, 'paid')
-    sub = await db.add_or_extend_subscription(
-        telegram_id=user_id,
-        plan_id=plan['id'],
-        duration_seconds=plan['duration_seconds']
-    )
-
-    exp_time = sub['expires_at']
-    if isinstance(exp_time, str):
-        exp_time = datetime.fromisoformat(exp_time)
-    if exp_time.tzinfo is None:
-        exp_time = exp_time.replace(tzinfo=timezone.utc)
-
-    pool_item = await db.get_available_invite()
-    
-    if pool_item:
-        invite_link = pool_item['invite_link']
-        await db.mark_invite_used(pool_item['id'])
-        
-        try:
-            await bot.revoke_chat_invite_link(chat_id=CHANNEL_ID, invite_link=invite_link)
-        except Exception as e:
-            logger.warning(f"Failed to revoke link from Telegram channel: {e}")
-            
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    chat_id=admin_id,
-                    text=f"🚨 <b>INVITE LINK CONSUMED & REVOKED</b>\n\nUser <code>{user_id}</code> completed payment.\nLink: {invite_link}\nStatus: Removed from Pool & Revoked in Channel."
-                )
-            except Exception:
-                pass
-    else:
-        try:
-            link_expire = min(exp_time, datetime.now(timezone.utc) + timedelta(days=7))
-            invite = await bot.create_chat_invite_link(
-                chat_id=CHANNEL_ID,
-                name=f"Sub #{sub['id']} - User {user_id}",
-                member_limit=1,
-                expire_date=link_expire
-            )
-            invite_link = invite.invite_link
-        except Exception as e:
-            logger.error(f"Failed dynamic invite creation for user {user_id}: {e}")
-            return False
-
-    formatted_exp = exp_time.strftime("%d %b %Y, %H:%M UTC")
-
-    success_msg = (
-        "🎉 <b>ACCESS GRANTED!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>Plan:</b> {html.quote(plan['name'])}\n"
-        f"<b>Status:</b> 🟢 Active\n"
-        f"⏳ <b>Expires:</b> <code>{formatted_exp}</code>\n\n"
-        "<b>Your Exclusive Access Link:</b>\n"
-        f"🔗 {invite_link}\n\n"
-        "⚠️ <i>Use this link immediately to join.</i>"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 JOIN CHANNEL NOW", url=invite_link)],
-        [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="nav_main")]
-    ])
-
-    try:
-        await bot.send_message(chat_id=user_id, text=success_msg, reply_markup=kb)
-        return True
-    except Exception as e:
-        logger.error(f"Failed sending access message to user {user_id}: {e}")
-        return False
-
-def parse_duration_to_seconds(value: int, unit: str) -> int:
-    unit = unit.lower()
-    if unit in ["minute", "minutes"]: return value * 60
-    elif unit in ["hour", "hours"]: return value * 3600
-    elif unit in ["day", "days"]: return value * 86400
-    elif unit in ["week", "weeks"]: return value * 604800
-    elif unit in ["month", "months"]: return value * 30 * 86400
-    elif unit in ["year", "years"]: return value * 365 * 86400
-    else: raise ValueError(f"Unsupported duration unit: {unit}")
-
-def format_remaining_time(seconds: float) -> str:
-    if seconds <= 0: return "Expired"
-    days = int(seconds // 86400)
-    hours = int((seconds % 86400) // 3600)
-    minutes = int((seconds % 3600) // 60)
-    
-    parts = []
-    if days > 0: parts.append(f"{days}d")
-    if hours > 0 or days > 0: parts.append(f"{hours:02d}h")
-    parts.append(f"{minutes:02d}m")
-    return " ".join(parts)
-
-def get_main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(text="💎 BUY PREMIUM", callback_data="user_buy")],
-        [
-            InlineKeyboardButton(text="👤 MY PROFILE", callback_data="user_profile"),
-            InlineKeyboardButton(text="⏳ SUBSCRIPTION", callback_data="user_sub")
-        ],
-        [
-            InlineKeyboardButton(text="💳 PAYMENTS", callback_data="user_payments"),
-            InlineKeyboardButton(text="🆘 SUPPORT", callback_data="user_support")
-        ]
-    ]
-    if is_admin:
-        buttons.append([InlineKeyboardButton(text="🛠 ADMIN PANEL", callback_data="admin_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_back_keyboard(target: str = "nav_main") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Back", callback_data=target)]
-    ])
-
-def get_plans_keyboard(plans: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    buttons = []
-    for plan in plans:
-        symbol = "⭐" if plan['currency'] == "XTR" else "💵"
-        btn_text = f"{symbol} {plan['name']} — {int(plan['price']) if plan['currency'] == 'XTR' else plan['price']} {plan['currency']}"
-        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"select_plan_{plan['id']}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Main Menu", callback_data="nav_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_admin_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📊 Statistics", callback_data="admin_stats"),
-            InlineKeyboardButton(text="📦 Manage Plans", callback_data="admin_plans")
-        ],
-        [
-            InlineKeyboardButton(text="🔗 Bulk Invites", callback_data="admin_bulk_invites"),
-            InlineKeyboardButton(text="👥 Users", callback_data="admin_users")
-        ],
-        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="nav_main")]
-    ])
-
-def get_crypto_options_keyboard(plan_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🟧 BTC", callback_data=f"pay_crypto_{plan_id}_BTC"),
-            InlineKeyboardButton(text="🟦 LTC", callback_data=f"pay_crypto_{plan_id}_LTC"),
-            InlineKeyboardButton(text="🔷 ETH", callback_data=f"pay_crypto_{plan_id}_ETH")
-        ],
-        [
-            InlineKeyboardButton(text="🟣 SOL", callback_data=f"pay_crypto_{plan_id}_SOL"),
-            InlineKeyboardButton(text="💎 TON", callback_data=f"pay_crypto_{plan_id}_TON"),
-            InlineKeyboardButton(text="🔒 XMR", callback_data=f"pay_crypto_{plan_id}_XMR")
-        ],
-        [
-            InlineKeyboardButton(text="🟡 BNB", callback_data=f"pay_crypto_{plan_id}_BNB"),
-            InlineKeyboardButton(text="🔴 TRX", callback_data=f"pay_crypto_{plan_id}_TRX"),
-            InlineKeyboardButton(text="🐕 DOGE", callback_data=f"pay_crypto_{plan_id}_DOGE")
-        ],
-        [
-            InlineKeyboardButton(text="💲 USDC (SOL)", callback_data=f"pay_crypto_{plan_id}_USDC_SOL"),
-            InlineKeyboardButton(text="💲 USDC (BSC)", callback_data=f"pay_crypto_{plan_id}_USDC_BSC"),
-            InlineKeyboardButton(text="🟡 DAI (ETH)", callback_data=f"pay_crypto_{plan_id}_DAI_ETH")
-        ],
-        [
-            InlineKeyboardButton(text="💵 USDT (TRX)", callback_data=f"pay_crypto_{plan_id}_USDT_TRX"),
-            InlineKeyboardButton(text="💵 USDT (ETH)", callback_data=f"pay_crypto_{plan_id}_USDT_ETH"),
-            InlineKeyboardButton(text="💵 USDT (SOL)", callback_data=f"pay_crypto_{plan_id}_USDT_SOL")
-        ],
-        [
-            InlineKeyboardButton(text="💵 USDT (BSC)", callback_data=f"pay_crypto_{plan_id}_USDT_BSC"),
-            InlineKeyboardButton(text="💵 USDT (TON)", callback_data=f"pay_crypto_{plan_id}_USDT_TON")
-        ],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="user_buy")]
-    ])
-
-# =============================================================================
-# 4. ROUTER & HANDLERS
-# =============================================================================
-
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+dp.include_router(router)
 
-def is_admin_user(user_id: int) -> bool:
+app = FastAPI(title="Telegram Pack Bot")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+
+def money(value: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return "0.00"
+
+
+def safe_text(value: Any, limit: int = 1000) -> str:
+    text = str(value or "")
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    return text[:limit]
+
+
+def username_text(user) -> str:
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    return str(user.id)
+
+
+def parse_amount(text: str) -> Optional[float]:
+    try:
+        value = Decimal(text.replace(",", "").strip())
+        if value <= 0:
+            return None
+        return float(value)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def main_menu(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Buy Pack", callback_data="menu:packs"),
+        ],
+        [
+            InlineKeyboardButton(text="Pay Money", callback_data="menu:money"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="Book Custom Appointment",
+                callback_data="menu:appointment",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="Direct Talk",
+                callback_data="menu:support",
+            ),
+        ],
+        [
+            InlineKeyboardButton(text="Wallet", callback_data="menu:wallet"),
+            InlineKeyboardButton(text="Top Up", callback_data="menu:topup"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="My Purchases",
+                callback_data="menu:purchases",
+            ),
+            InlineKeyboardButton(
+                text="Help",
+                callback_data="menu:help",
+            ),
+        ],
+    ]
+
+    if is_admin(user_id):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Admin Panel",
+                    callback_data="admin:panel",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Back",
+                    callback_data="menu:main",
+                )
+            ]
+        ]
+    )
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Cancel",
+                    callback_data="flow:cancel",
+                )
+            ]
+        ]
+    )
+
+
+def pack_media_counts(pack: dict) -> tuple[int, int]:
+    media = pack.get("media", [])
+    photos = sum(1 for x in media if x.get("type") == "photo")
+    videos = sum(1 for x in media if x.get("type") == "video")
+    return photos, videos
+
+
+async def notify_admins(text: str, reply_markup=None):
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                text,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            logger.exception("Failed notifying admin %s", admin_id)
+
+
+async def ensure_user(tg_user):
+    existing = await db.users.find_one({"telegram_id": tg_user.id})
+
+    if existing:
+        update = {
+            "username": tg_user.username,
+            "first_name": tg_user.first_name,
+            "updated_at": now(),
+        }
+
+        await db.users.update_one(
+            {"telegram_id": tg_user.id},
+            {"$set": update},
+        )
+
+        return existing
+
+    document = {
+        "telegram_id": tg_user.id,
+        "username": tg_user.username,
+        "first_name": tg_user.first_name,
+        "language": tg_user.language_code or "en",
+        "created_at": now(),
+        "updated_at": now(),
+        "balances": {
+            "inr": 0.0,
+            "usd": 0.0,
+            "usdt": 0.0,
+            "stars": 0,
+        },
+        "blocked": False,
+    }
+
+    await db.users.insert_one(document)
+
+    await notify_admins(
+        "👤 <b>New User</b>\n\n"
+        f"User: {safe_text(username_text(tg_user))}\n"
+        f"ID: <code>{tg_user.id}</code>"
+    )
+
+    return document
+
+
+async def get_user(user_id: int):
+    return await db.users.find_one({"telegram_id": user_id})
+
+
+async def next_pack_id() -> str:
+    counter = await db.counters.find_one_and_update(
+        {"_id": "packs"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    return f"PACK-{int(counter['value']):06d}"
+
+
+async def next_purchase_id() -> str:
+    counter = await db.counters.find_one_and_update(
+        {"_id": "purchases"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    return f"PUR-{int(counter['value']):08d}"
+
+
+async def next_payment_id() -> str:
+    counter = await db.counters.find_one_and_update(
+        {"_id": "payments"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    return f"PAY-{int(counter['value']):08d}"
+
+
+# ============================================================
+# FSM STATES
+# ============================================================
+
+class AddPackStates(StatesGroup):
+    name = State()
+    description = State()
+    media = State()
+    price_inr = State()
+    price_usd = State()
+    price_usdt = State()
+    price_stars = State()
+    preview = State()
+
+
+class UPIStates(StatesGroup):
+    amount = State()
+    proof = State()
+
+
+class CryptoStates(StatesGroup):
+    amount = State()
+
+
+class StarsTopUpStates(StatesGroup):
+    amount = State()
+
+
+class AppointmentStates(StatesGroup):
+    name = State()
+    date = State()
+    time = State()
+    description = State()
+    confirmation = State()
+
+
+class SupportStates(StatesGroup):
+    chatting = State()
+
+
+class BalanceAdminStates(StatesGroup):
+    user_id = State()
+    currency = State()
+    amount = State()
+
+
+class BroadcastStates(StatesGroup):
+    message = State()
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def admin_panel_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Add Pack",
+                    callback_data="admin:add_pack",
+                ),
+                InlineKeyboardButton(
+                    text="Manage Packs",
+                    callback_data="admin:packs",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Manage Users",
+                    callback_data="admin:users",
+                ),
+                InlineKeyboardButton(
+                    text="Payment Verification",
+                    callback_data="admin:payments",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Appointments",
+                    callback_data="admin:appointments",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Broadcast",
+                    callback_data="admin:broadcast",
+                ),
+                InlineKeyboardButton(
+                    text="Statistics",
+                    callback_data="admin:stats",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Main Menu",
+                    callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+
+def media_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Add Photo",
+                    callback_data="packmedia:photo",
+                ),
+                InlineKeyboardButton(
+                    text="Add Video",
+                    callback_data="packmedia:video",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Add From Channel",
+                    callback_data="packmedia:channel",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Finish Pack",
+                    callback_data="packmedia:finish",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Cancel",
+                    callback_data="flow:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def price_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="INR Price",
+                    callback_data="packprice:inr",
+                ),
+                InlineKeyboardButton(
+                    text="USD Price",
+                    callback_data="packprice:usd",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="USDT Price",
+                    callback_data="packprice:usdt",
+                ),
+                InlineKeyboardButton(
+                    text="Stars Price",
+                    callback_data="packprice:stars",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Skip",
+                    callback_data="packprice:skip",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Cancel",
+                    callback_data="flow:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def wallet_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Top Up",
+                    callback_data="menu:topup",
+                ),
+                InlineKeyboardButton(
+                    text="Transaction History",
+                    callback_data="wallet:history",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Back",
+                    callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+
+def topup_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="UPI",
+                    callback_data="topup:upi",
+                ),
+                InlineKeyboardButton(
+                    text="Crypto",
+                    callback_data="topup:crypto",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Telegram Stars",
+                    callback_data="topup:stars",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Back",
+                    callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+
+# ============================================================
+# START / BASIC COMMANDS
+# ============================================================
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def start_handler(message: Message, state: FSMContext):
     await state.clear()
-    await db.upsert_user(
-        telegram_id=message.from_user.id,
-        username=message.from_user.username,
-        first_name=message.from_user.first_name
+    await ensure_user(message.from_user)
+
+    await message.answer(
+        "Hello 👋\n"
+        "Welcome! Choose an option below to continue.",
+        reply_markup=main_menu(message.from_user.id),
     )
 
-    text = (
-        "🌟 <b>WELCOME TO PREMIUM HUB</b> 🌟\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Hello <b>{html.quote(message.from_user.first_name)}</b>! 👋\n\n"
-        "Get instant automated access to our VIP Private Channel.\n"
-        "Choose an option below to get started:"
-    )
-    
-    is_admin = is_admin_user(message.from_user.id)
-    await message.answer(text, reply_markup=get_main_menu_keyboard(is_admin))
 
-@router.callback_query(F.data == "nav_main")
-async def nav_main_callback(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.answer()
-    text = (
-        "🌟 <b>PREMIUM MAIN MENU</b> 🌟\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Welcome back, <b>{html.quote(callback.from_user.first_name)}</b>!\n"
-        "Please choose an action below:"
-    )
-    is_admin = is_admin_user(callback.from_user.id)
-    await callback.message.edit_text(text, reply_markup=get_main_menu_keyboard(is_admin))
+@router.message(Command("help"))
+async def help_handler(message: Message):
+    await ensure_user(message.from_user)
 
-@router.callback_query(F.data == "user_profile")
-async def user_profile_callback(callback: CallbackQuery):
-    await callback.answer()
-    user = await db.get_user(callback.from_user.id)
-    sub = await db.get_active_subscription(callback.from_user.id)
-
-    status_str = "🟢 ACTIVE" if sub else "⚪ INACTIVE"
-    plan_str = sub['plan_name'] if sub else "None"
-    
-    if sub:
-        exp_dt = sub['expires_at']
-        if isinstance(exp_dt, str): exp_dt = datetime.fromisoformat(exp_dt)
-        if exp_dt.tzinfo is None: exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-            
-        rem_sec = (exp_dt - datetime.now(timezone.utc)).total_seconds()
-        rem_str = format_remaining_time(rem_sec)
-        exp_str = exp_dt.strftime("%d %b %Y, %H:%M UTC")
-    else:
-        rem_str = "N/A"
-        exp_str = "N/A"
-
-    uname = f"@{user['username']}" if user and user.get('username') else "Not set"
-
-    text = (
-        "👤 <b>YOUR VIP PROFILE</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>User ID:</b> <code>{callback.from_user.id}</code>\n"
-        f"<b>Username:</b> {html.quote(uname)}\n\n"
-        f"💎 <b>Status:</b> {status_str}\n"
-        f"📦 <b>Current Plan:</b> {html.quote(plan_str)}\n"
-        f"⏳ <b>Time Remaining:</b> {rem_str}\n"
-        f"📅 <b>Expires On:</b> <code>{exp_str}</code>"
+    await message.answer(
+        "<b>Help</b>\n\n"
+        "Use the menu to buy packs, manage your wallet, "
+        "top up your balance, book an appointment, or contact support.",
+        reply_markup=main_menu(message.from_user.id),
     )
 
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard())
 
-@router.callback_query(F.data == "user_sub")
-async def user_sub_callback(callback: CallbackQuery):
-    await callback.answer()
-    sub = await db.get_active_subscription(callback.from_user.id)
-    if not sub:
-        text = (
-            "⏳ <b>MY SUBSCRIPTION</b>\n\n"
-            "You do not have an active subscription right now."
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 BUY ACCESS NOW", callback_data="user_buy")],
-            [InlineKeyboardButton(text="🔙 Back", callback_data="nav_main")]
-        ])
-    else:
-        exp_dt = sub['expires_at']
-        if isinstance(exp_dt, str): exp_dt = datetime.fromisoformat(exp_dt)
-        if exp_dt.tzinfo is None: exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+@router.message(Command("wallet"))
+async def wallet_command(message: Message):
+    await show_wallet(message.from_user.id, message)
 
-        rem_sec = (exp_dt - datetime.now(timezone.utc)).total_seconds()
-        
-        text = (
-            "⏳ <b>ACTIVE SUBSCRIPTION</b>\n\n"
-            f"📦 <b>Plan:</b> {html.quote(sub['plan_name'])}\n"
-            f"⏳ <b>Time Left:</b> {format_remaining_time(rem_sec)}\n"
-            f"📅 <b>Expires At:</b> <code>{exp_dt.strftime('%d %b %Y, %H:%M UTC')}</code>"
-        )
-        kb = get_back_keyboard()
 
-    await callback.message.edit_text(text, reply_markup=kb)
+@router.message(Command("packs"))
+async def packs_command(message: Message):
+    await show_packs(message, 1)
 
-@router.callback_query(F.data == "user_buy")
-async def user_buy_callback(callback: CallbackQuery):
-    await callback.answer()
-    plans = await db.get_active_plans()
-    if not plans:
-        await callback.message.edit_text("💎 <b>PREMIUM PLANS</b>\n\nNo subscription plans available currently.", reply_markup=get_back_keyboard())
+
+@router.message(Command("purchases"))
+async def purchases_command(message: Message):
+    await show_purchases(message.from_user.id, message)
+
+
+@router.message(Command("topup"))
+async def topup_command(message: Message):
+    await message.answer(
+        "Choose a top-up method:",
+        reply_markup=topup_keyboard(),
+    )
+
+
+@router.message(Command("appointment"))
+async def appointment_command(message: Message, state: FSMContext):
+    await start_appointment(message, state)
+
+
+@router.message(Command("support"))
+async def support_command(message: Message, state: FSMContext):
+    await start_support(message, state)
+
+
+@router.message(Command("admin"))
+async def admin_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("This command is only available to administrators.")
         return
 
-    text = "💎 <b>AVAILABLE PREMIUM PLANS</b>\n\nSelect a plan to unlock full VIP channel access:"
-    await callback.message.edit_text(text, reply_markup=get_plans_keyboard(plans))
-
-@router.callback_query(F.data == "user_payments")
-async def user_payments_callback(callback: CallbackQuery):
-    await callback.answer()
-    payments = await db.get_user_payments(callback.from_user.id)
-    
-    if not payments:
-        text = "💳 <b>PAYMENT HISTORY</b>\n\nNo active or past transaction records found."
-    else:
-        text = "💳 <b>PAYMENT HISTORY</b>\n\n"
-        for p in payments:
-            status_icon = "✅" if p['status'] == 'paid' else "🟡" if p['status'] == 'pending' else "❌"
-            dt = datetime.fromisoformat(str(p['created_at'])).strftime("%d %b %Y, %H:%M")
-            plan_name = p['plan_name'] if p['plan_name'] else "Subscription Plan"
-            text += f"{status_icon} <b>{html.quote(plan_name)}</b> — {p['amount']} {p['currency']}\n<code>{dt}</code>\n\n"
-
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard())
-
-@router.callback_query(F.data == "user_support")
-async def user_support_callback(callback: CallbackQuery):
-    await callback.answer()
-    text = (
-        "🆘 <b>CUSTOMER SUPPORT</b>\n\n"
-        "Have questions or need help with access?\n"
-        "Feel free to reach out to our team directly:\n\n"
-        "💬 <b>Support Contact:</b> @YourSupportUsername"
+    await message.answer(
+        "<b>Admin Panel</b>",
+        reply_markup=admin_panel_keyboard(),
     )
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard())
 
-@router.callback_query(F.data.startswith("select_plan_"))
-async def select_plan_callback(callback: CallbackQuery):
-    await callback.answer()
-    plan_id = int(callback.data.split("_")[2])
-    plan = await db.get_plan(plan_id)
-    
-    if not plan or not plan['active']:
-        await callback.message.edit_text("❌ Plan is no longer active.", reply_markup=get_back_keyboard("user_buy"))
+
+# ============================================================
+# MAIN MENU CALLBACKS
+# ============================================================
+
+@router.callback_query(F.data == "menu:main")
+async def menu_main(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+
+    await call.message.edit_text(
+        "Hello 👋\n"
+        "Welcome! Choose an option below to continue.",
+        reply_markup=main_menu(call.from_user.id),
+    )
+
+
+@router.callback_query(F.data == "menu:packs")
+async def menu_packs(call: CallbackQuery):
+    await call.answer()
+    await show_packs(call.message, 1)
+
+
+@router.callback_query(F.data == "menu:money")
+async def menu_money(call: CallbackQuery):
+    await call.answer()
+
+    user = await get_user(call.from_user.id)
+    balances = user.get("balances", {})
+
+    await call.message.edit_text(
+        "<b>Payment / Wallet</b>\n\n"
+        f"🇮🇳 INR: ₹{money(balances.get('inr', 0))}\n"
+        f"💵 USDT: {money(balances.get('usdt', 0), 6)}\n"
+        f"⭐ Stars: {int(balances.get('stars', 0))}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Add INR",
+                        callback_data="topup:upi",
+                    ),
+                    InlineKeyboardButton(
+                        text="Add USDT",
+                        callback_data="topup:crypto",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Add Stars",
+                        callback_data="topup:stars",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Wallet History",
+                        callback_data="wallet:history",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data="menu:main",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "menu:wallet")
+async def menu_wallet(call: CallbackQuery):
+    await call.answer()
+    await show_wallet(call.from_user.id, call.message)
+
+
+@router.callback_query(F.data == "menu:topup")
+async def menu_topup(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "Choose a top-up method:",
+        reply_markup=topup_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "menu:purchases")
+async def menu_purchases(call: CallbackQuery):
+    await call.answer()
+    await show_purchases(call.from_user.id, call.message)
+
+
+@router.callback_query(F.data == "menu:help")
+async def menu_help(call: CallbackQuery):
+    await call.answer()
+
+    await call.message.edit_text(
+        "<b>Help</b>\n\n"
+        "• Buy Pack — browse available packs.\n"
+        "• Pay Money — view payment balances.\n"
+        "• Top Up — add funds.\n"
+        "• Wallet — view balances and transactions.\n"
+        "• Appointment — request a custom appointment.\n"
+        "• Direct Talk — contact support.",
+        reply_markup=back_menu(),
+    )
+
+
+@router.callback_query(F.data == "menu:appointment")
+async def menu_appointment(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await start_appointment(call.message, state)
+
+
+@router.callback_query(F.data == "menu:support")
+async def menu_support(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await start_support(call.message, state)
+
+
+# ============================================================
+# PACK LISTING
+# ============================================================
+
+async def show_packs(message: Message, page: int = 1):
+    page_size = 5
+    skip = (page - 1) * page_size
+
+    total = await db.packs.count_documents({"active": True})
+
+    packs = await (
+        db.packs.find({"active": True})
+        .sort("created_at", DESCENDING)
+        .skip(skip)
+        .limit(page_size)
+        .to_list(length=page_size)
+    )
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    if page > total_pages:
+        page = total_pages
+
+    if not packs:
+        await message.edit_text(
+            "📦 No packs are currently available.",
+            reply_markup=back_menu(),
+        )
         return
 
-    symbol = "⭐" if plan['currency'] == "XTR" else "💰"
-    formatted_price = int(plan['price']) if plan['currency'] == "XTR" else plan['price']
+    rows = []
 
-    text = (
-        f"💎 <b>{html.quote(plan['name'].upper())}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{symbol} <b>Price:</b> {formatted_price} {plan['currency']}\n"
-        f"⏱ <b>Duration:</b> {plan['duration_value']} {plan['duration_unit'].capitalize()}\n\n"
-        f"📝 <b>Description:</b>\n<i>{html.quote(plan['description'] or 'No description provided.')}</i>"
+    for pack in packs:
+        photos, videos = pack_media_counts(pack)
+
+        text = (
+            f"📦 <b>{safe_text(pack['name'])}</b>\n"
+            f"📸 {photos} Photos • 🎥 {videos} Videos\n"
+            f"₹{money(pack.get('price_inr', 0))} / "
+            f"${money(pack.get('price_usd', 0))} / "
+            f"{money(pack.get('price_usdt', 0), 6)} USDT / "
+            f"{int(pack.get('price_stars', 0))} ⭐"
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"View • {pack['name'][:25]}",
+                    callback_data=f"pack:view:{pack['pack_id']}",
+                )
+            ]
+        )
+
+    navigation = []
+
+    if page > 1:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Previous",
+                callback_data=f"packs:page:{page - 1}",
+            )
+        )
+
+    navigation.append(
+        InlineKeyboardButton(
+            text=f"Page {page}/{total_pages}",
+            callback_data="noop",
+        )
     )
 
-    if plan['currency'] == "XTR":
-        buttons = [[InlineKeyboardButton(text="⭐ PAY WITH STARS", callback_data=f"pay_plan_stars_{plan['id']}")]]
+    if page < total_pages:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Next",
+                callback_data=f"packs:page:{page + 1}",
+            )
+        )
+
+    rows.append(navigation)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Back",
+                callback_data="menu:main",
+            )
+        ]
+    )
+
+    display = "📦 <b>Available Packs</b>\n\n"
+
+    for pack in packs:
+        photos, videos = pack_media_counts(pack)
+
+        display += (
+            f"<b>{safe_text(pack['name'])}</b>\n"
+            f"📸 {photos} Photos • 🎥 {videos} Videos\n"
+            f"₹{money(pack.get('price_inr', 0))} / "
+            f"${money(pack.get('price_usd', 0))} / "
+            f"{money(pack.get('price_usdt', 0), 6)} USDT / "
+            f"{int(pack.get('price_stars', 0))} ⭐\n\n"
+        )
+
+    await message.edit_text(
+        display,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("packs:page:"))
+async def packs_page(call: CallbackQuery):
+    await call.answer()
+
+    page = int(call.data.split(":")[-1])
+    await show_packs(call.message, page)
+
+
+@router.callback_query(F.data == "noop")
+async def noop(call: CallbackQuery):
+    await call.answer()
+
+
+# ============================================================
+# PACK DETAILS
+# ============================================================
+
+@router.callback_query(F.data.startswith("pack:view:"))
+async def pack_view(call: CallbackQuery):
+    await call.answer()
+
+    pack_id = call.data.split(":", 2)[2]
+    pack = await db.packs.find_one(
+        {
+            "pack_id": pack_id,
+            "active": True,
+        }
+    )
+
+    if not pack:
+        await call.message.edit_text(
+            "This pack is no longer available.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    photos, videos = pack_media_counts(pack)
+
+    await call.message.edit_text(
+        f"📦 <b>{safe_text(pack['name'])}</b>\n\n"
+        f"{safe_text(pack.get('description', ''))}\n\n"
+        f"📸 Photos: {photos}\n"
+        f"🎥 Videos: {videos}\n"
+        f"📦 Total Media: {photos + videos}\n\n"
+        "<b>Prices</b>\n"
+        f"🇮🇳 INR: ₹{money(pack.get('price_inr', 0))}\n"
+        f"🇺🇸 USD: ${money(pack.get('price_usd', 0))}\n"
+        f"💵 USDT: {money(pack.get('price_usdt', 0), 6)}\n"
+        f"⭐ Stars: {int(pack.get('price_stars', 0))}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Buy",
+                        callback_data=f"pack:buy:{pack_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data="menu:packs",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("pack:buy:"))
+async def pack_buy(call: CallbackQuery):
+    await call.answer()
+
+    pack_id = call.data.split(":", 2)[2]
+    pack = await db.packs.find_one(
+        {
+            "pack_id": pack_id,
+            "active": True,
+        }
+    )
+
+    if not pack:
+        await call.message.edit_text(
+            "Pack unavailable.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    await call.message.edit_text(
+        "Choose your payment method:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⭐ Pay with Stars",
+                        callback_data=f"pay:stars:{pack_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="💵 Pay with USDT Balance",
+                        callback_data=f"pay:usdt:{pack_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🇮🇳 Pay with INR Balance",
+                        callback_data=f"pay:inr:{pack_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="💳 Top Up Wallet",
+                        callback_data="menu:topup",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data=f"pack:view:{pack_id}",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+# ============================================================
+# STARS PACK PAYMENT
+# ============================================================
+
+@router.callback_query(F.data.startswith("pay:stars:"))
+async def pay_pack_stars(call: CallbackQuery):
+    await call.answer()
+
+    pack_id = call.data.split(":", 2)[2]
+
+    pack = await db.packs.find_one(
+        {
+            "pack_id": pack_id,
+            "active": True,
+        }
+    )
+
+    if not pack:
+        await call.message.answer("Pack unavailable.")
+        return
+
+    amount = int(pack.get("price_stars", 0))
+
+    if amount <= 0:
+        await call.message.answer(
+            "Stars payment is not configured for this pack."
+        )
+        return
+
+    payload = f"pack|{pack_id}|{call.from_user.id}|{amount}"
+
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title=pack["name"][:32],
+            description=(
+                pack.get("description", "Pack purchase")[:255]
+            ),
+            payload=payload,
+            currency="XTR",
+            prices=[
+                LabeledPrice(
+                    label=pack["name"][:32],
+                    amount=amount,
+                )
+            ],
+            provider_token="",
+        )
+    except Exception:
+        logger.exception("Stars invoice error")
+        await call.message.answer(
+            "Unable to create the Stars invoice right now."
+        )
+
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery):
+    try:
+        parts = query.invoice_payload.split("|")
+
+        if len(parts) != 4 or parts[0] != "pack":
+            await query.answer(
+                ok=False,
+                error_message="Invalid payment payload.",
+            )
+            return
+
+        pack_id = parts[1]
+        user_id = int(parts[2])
+        expected_amount = int(parts[3])
+
+        if user_id != query.from_user.id:
+            await query.answer(
+                ok=False,
+                error_message="Payment user mismatch.",
+            )
+            return
+
+        pack = await db.packs.find_one(
+            {
+                "pack_id": pack_id,
+                "active": True,
+            }
+        )
+
+        if not pack:
+            await query.answer(
+                ok=False,
+                error_message="This pack is unavailable.",
+            )
+            return
+
+        if int(pack.get("price_stars", 0)) != expected_amount:
+            await query.answer(
+                ok=False,
+                error_message="Price has changed. Please create a new invoice.",
+            )
+            return
+
+        if query.total_amount != expected_amount:
+            await query.answer(
+                ok=False,
+                error_message="Invalid payment amount.",
+            )
+            return
+
+        await query.answer(ok=True)
+
+    except Exception:
+        logger.exception("Pre-checkout error")
+
+        try:
+            await query.answer(
+                ok=False,
+                error_message="Unable to validate payment.",
+            )
+        except Exception:
+            pass
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    payment = message.successful_payment
+
+    if not payment:
+        return
+
+    if payment.currency != "XTR":
+        return
+
+    payload = payment.invoice_payload
+    parts = payload.split("|")
+
+    if len(parts) != 4 or parts[0] != "pack":
+        return
+
+    pack_id = parts[1]
+
+    try:
+        expected_user_id = int(parts[2])
+        expected_amount = int(parts[3])
+    except ValueError:
+        return
+
+    if expected_user_id != message.from_user.id:
+        logger.warning("Payment user mismatch")
+        return
+
+    if payment.total_amount != expected_amount:
+        logger.warning("Stars amount mismatch")
+        return
+
+    # Idempotency based on Telegram charge ID.
+    existing = await db.payments.find_one(
+        {
+            "telegram_payment_charge_id":
+                payment.telegram_payment_charge_id
+        }
+    )
+
+    if existing:
+        await message.answer(
+            "This payment has already been processed."
+        )
+        return
+
+    pack = await db.packs.find_one(
+        {
+            "pack_id": pack_id,
+            "active": True,
+        }
+    )
+
+    if not pack:
+        await message.answer(
+            "Payment received, but the pack is unavailable. "
+            "Please contact support."
+        )
+        return
+
+    payment_id = await next_payment_id()
+
+    await db.payments.insert_one(
+        {
+            "payment_id": payment_id,
+            "user_id": message.from_user.id,
+            "method": "stars",
+            "status": "paid",
+            "pack_id": pack_id,
+            "amount": payment.total_amount,
+            "currency": "XTR",
+            "telegram_payment_charge_id":
+                payment.telegram_payment_charge_id,
+            "provider_payment_charge_id":
+                payment.provider_payment_charge_id,
+            "created_at": now(),
+        }
+    )
+
+    purchase = await create_purchase_and_deliver(
+        user_id=message.from_user.id,
+        pack=pack,
+        amount=payment.total_amount,
+        currency="XTR",
+        payment_method="telegram_stars",
+        reference=payment.telegram_payment_charge_id,
+    )
+
+    if purchase:
+        await message.answer(
+            "Purchase completed successfully ✅\n\n"
+            "Your pack has been delivered."
+        )
+
+        await notify_admins(
+            "⭐ <b>Successful Stars Purchase</b>\n\n"
+            f"User: {safe_text(username_text(message.from_user))}\n"
+            f"Pack: {safe_text(pack['name'])}\n"
+            f"Amount: {payment.total_amount} ⭐"
+        )
+
+
+# ============================================================
+# BALANCE PURCHASES
+# ============================================================
+
+async def deduct_balance(
+    user_id: int,
+    currency: str,
+    amount: float,
+    reference: str,
+) -> Optional[dict]:
+    if amount <= 0:
+        return None
+
+    field = f"balances.{currency}"
+
+    user = await db.users.find_one_and_update(
+        {
+            "telegram_id": user_id,
+            field: {"$gte": amount},
+            "blocked": {"$ne": True},
+        },
+        {
+            "$inc": {
+                field: -amount,
+            },
+            "$set": {
+                "updated_at": now(),
+            },
+        },
+        return_document=ReturnDocument.BEFORE,
+    )
+
+    if not user:
+        return None
+
+    before = float(
+        user.get("balances", {}).get(currency, 0)
+    )
+    after = before - amount
+
+    await db.transactions.insert_one(
+        {
+            "user_id": user_id,
+            "type": "purchase_debit",
+            "currency": currency,
+            "amount": -amount,
+            "balance_before": before,
+            "balance_after": after,
+            "reference": reference,
+            "status": "completed",
+            "created_at": now(),
+        }
+    )
+
+    return {
+        "before": before,
+        "after": after,
+    }
+
+
+@router.callback_query(F.data.startswith("pay:usdt:"))
+async def pay_pack_usdt(call: CallbackQuery):
+    await call.answer()
+
+    pack_id = call.data.split(":", 2)[2]
+
+    pack = await db.packs.find_one(
+        {
+            "pack_id": pack_id,
+            "active": True,
+        }
+    )
+
+    if not pack:
+        await call.message.answer("Pack unavailable.")
+        return
+
+    amount = float(pack.get("price_usdt", 0))
+
+    if amount <= 0:
+        await call.message.answer(
+            "USDT balance payment is not configured."
+        )
+        return
+
+    reference = f"PACK:{pack_id}:USDT:{call.from_user.id}"
+
+    result = await deduct_balance(
+        call.from_user.id,
+        "usdt",
+        amount,
+        reference,
+    )
+
+    if not result:
+        await call.message.edit_text(
+            "Insufficient USDT balance.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Top Up USDT",
+                            callback_data="topup:crypto",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Back",
+                            callback_data=f"pack:view:{pack_id}",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    await create_purchase_and_deliver(
+        user_id=call.from_user.id,
+        pack=pack,
+        amount=amount,
+        currency="USDT",
+        payment_method="usdt_balance",
+        reference=reference,
+    )
+
+    await call.message.edit_text(
+        "Purchase completed successfully ✅\n\n"
+        "Your pack has been delivered.",
+        reply_markup=main_menu(call.from_user.id),
+    )
+
+
+@router.callback_query(F.data.startswith("pay:inr:"))
+async def pay_pack_inr(call: CallbackQuery):
+    await call.answer()
+
+    pack_id = call.data.split(":", 2)[2]
+
+    pack = await db.packs.find_one(
+        {
+            "pack_id": pack_id,
+            "active": True,
+        }
+    )
+
+    if not pack:
+        await call.message.answer("Pack unavailable.")
+        return
+
+    amount = float(pack.get("price_inr", 0))
+
+    if amount <= 0:
+        await call.message.answer(
+            "INR balance payment is not configured."
+        )
+        return
+
+    reference = f"PACK:{pack_id}:INR:{call.from_user.id}"
+
+    result = await deduct_balance(
+        call.from_user.id,
+        "inr",
+        amount,
+        reference,
+    )
+
+    if not result:
+        await call.message.edit_text(
+            "Insufficient INR balance.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Top Up INR",
+                            callback_data="topup:upi",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Back",
+                            callback_data=f"pack:view:{pack_id}",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    await create_purchase_and_deliver(
+        user_id=call.from_user.id,
+        pack=pack,
+        amount=amount,
+        currency="INR",
+        payment_method="inr_balance",
+        reference=reference,
+    )
+
+    await call.message.edit_text(
+        "Purchase completed successfully ✅\n\n"
+        "Your pack has been delivered.",
+        reply_markup=main_menu(call.from_user.id),
+    )
+
+
+# ============================================================
+# PURCHASE DELIVERY
+# ============================================================
+
+async def create_purchase_and_deliver(
+    user_id: int,
+    pack: dict,
+    amount: float,
+    currency: str,
+    payment_method: str,
+    reference: str,
+):
+    purchase_id = await next_purchase_id()
+
+    photos, videos = pack_media_counts(pack)
+
+    purchase = {
+        "purchase_id": purchase_id,
+        "user_id": user_id,
+        "pack_id": pack["pack_id"],
+        "pack_name": pack["name"],
+        "amount": amount,
+        "currency": currency,
+        "photos_count": photos,
+        "videos_count": videos,
+        "payment_method": payment_method,
+        "reference": reference,
+        "created_at": now(),
+    }
+
+    # Unique reference prevents duplicate purchase creation.
+    try:
+        await db.purchases.insert_one(purchase)
+    except Exception:
+        existing = await db.purchases.find_one(
+            {"reference": reference}
+        )
+        if existing:
+            return existing
+        raise
+
+    media = pack.get("media", [])
+
+    for item in media:
+        try:
+            if item["type"] == "photo":
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=item["file_id"],
+                )
+
+            elif item["type"] == "video":
+                await bot.send_video(
+                    chat_id=user_id,
+                    video=item["file_id"],
+                )
+
+            await asyncio.sleep(0.05)
+
+        except TelegramForbiddenError:
+            logger.warning(
+                "User blocked bot: %s",
+                user_id,
+            )
+            break
+        except TelegramBadRequest:
+            logger.exception(
+                "Media delivery failed for %s",
+                user_id,
+            )
+
+    return purchase
+
+
+# ============================================================
+# WALLET
+# ============================================================
+
+async def show_wallet(user_id: int, target: Message):
+    user = await get_user(user_id)
+
+    if not user:
+        return
+
+    balances = user.get("balances", {})
+
+    text = (
+        "💰 <b>My Wallet</b>\n\n"
+        f"🇮🇳 INR Balance: ₹{money(balances.get('inr', 0))}\n"
+        f"💵 USDT Balance: {money(balances.get('usdt', 0), 6)}\n"
+        f"⭐ Stars Balance: {int(balances.get('stars', 0))}"
+    )
+
+    await target.edit_text(
+        text,
+        reply_markup=wallet_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "wallet:history")
+async def wallet_history(call: CallbackQuery):
+    await call.answer()
+
+    transactions = await (
+        db.transactions.find(
+            {"user_id": call.from_user.id}
+        )
+        .sort("created_at", DESCENDING)
+        .limit(10)
+        .to_list(length=10)
+    )
+
+    if not transactions:
+        text = "💰 <b>Transaction History</b>\n\nNo transactions yet."
     else:
-        buttons = [[InlineKeyboardButton(text="💳 PAY WITH CRYPTO", callback_data=f"show_crypto_opts_{plan['id']}")]]
+        text = "💰 <b>Transaction History</b>\n\n"
 
-    if is_admin_user(callback.from_user.id):
-        buttons.append([InlineKeyboardButton(text="🧪 Free Admin Pass (Testing)", callback_data=f"admin_free_test_{plan['id']}")])
+        for tx in transactions:
+            sign = "+" if tx.get("amount", 0) > 0 else ""
+            text += (
+                f"{tx.get('currency', '').upper()} "
+                f"{sign}{tx.get('amount', 0)}\n"
+                f"{safe_text(tx.get('type'))}\n"
+                f"{tx.get('created_at')}\n\n"
+            )
 
-    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="user_buy")])
-
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@router.callback_query(F.data.startswith("show_crypto_opts_"))
-async def show_crypto_opts_callback(callback: CallbackQuery):
-    await callback.answer()
-    plan_id = int(callback.data.split("_")[3])
-    text = "💳 <b>SELECT CRYPTOCURRENCY PAYMENT</b>\n\nChoose your preferred payment method below:"
-    await callback.message.edit_text(text, reply_markup=get_crypto_options_keyboard(plan_id))
-
-@router.callback_query(F.data.startswith("pay_crypto_"))
-async def pay_crypto_selected(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    parts = callback.data.split("_")
-    plan_id = int(parts[2])
-    coin_key = "_".join(parts[3:])
-    
-    plan = await db.get_plan(plan_id)
-    wallet_addr = WALLETS.get(coin_key, "WALLET_ADDRESS_NOT_SET")
-    
-    tx_id = f"CRYPTO-{callback.from_user.id}-{plan_id}-{int(datetime.now(timezone.utc).timestamp())}"
-    await db.create_payment_record(callback.from_user.id, plan_id, tx_id, plan['price'], coin_key)
-    
-    await state.update_data(pending_tx_id=tx_id, plan_id=plan_id, coin=coin_key)
-    await state.set_state(UserPaymentProofStates.waiting_proof)
-
-    text = (
-        f"💰 <b>PAYMENT INSTRUCTIONS ({coin_key.replace('_', ' ')})</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 <b>Plan:</b> {html.quote(plan['name'])}\n"
-        f"💵 <b>Amount Due:</b> ${plan['price']} USD (equivalent in {coin_key.split('_')[0]})\n\n"
-        f"📥 <b>Deposit Address:</b>\n<code>{wallet_addr}</code>\n\n"
-        "📌 <b>Next Steps:</b>\n"
-        "1. Send the payment to the wallet address above.\n"
-        "2. Send your <b>Transaction ID / Hash</b> or a <b>Screenshot proof</b> here in the chat below:"
+    await call.message.edit_text(
+        text,
+        reply_markup=back_menu(),
     )
 
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard("user_buy"))
 
-@router.message(UserPaymentProofStates.waiting_proof)
-async def process_user_proof(message: Message, state: FSMContext):
+# ============================================================
+# UPI TOP UP
+# ============================================================
+
+@router.callback_query(F.data == "topup:upi")
+async def topup_upi(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    await state.set_state(UPIStates.amount)
+
+    await call.message.edit_text(
+        "Enter the amount you want to add in INR.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(UPIStates.amount)
+async def upi_amount(message: Message, state: FSMContext):
+    amount = parse_amount(message.text or "")
+
+    if not amount:
+        await message.answer(
+            "Please enter a valid positive amount.",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    await state.update_data(amount=amount)
+    await state.set_state(UPIStates.proof)
+
+    await message.answer(
+        "<b>UPI Top Up</b>\n\n"
+        f"Amount: ₹{money(amount)}\n"
+        f"UPI ID: <code>{safe_text(UPI_ID)}</code>\n\n"
+        "Complete the payment and send the payment screenshot.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data="flow:cancel",
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@router.message(UPIStates.proof, F.photo)
+async def upi_proof(message: Message, state: FSMContext):
     data = await state.get_data()
-    tx_id = data.get("pending_tx_id")
-    plan_id = data.get("plan_id")
-    coin = data.get("coin")
-    
-    await state.clear()
+    amount = float(data["amount"])
+
+    proof_file_id = message.photo[-1].file_id
+
+    payment_id = await next_payment_id()
+
+    await db.payments.insert_one(
+        {
+            "payment_id": payment_id,
+            "user_id": message.from_user.id,
+            "method": "upi",
+            "amount": amount,
+            "currency": "INR",
+            "proof_file_id": proof_file_id,
+            "status": "pending",
+            "created_at": now(),
+        }
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Approve",
+                    callback_data=f"payment:approve:{payment_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Reject",
+                    callback_data=f"payment:reject:{payment_id}",
+                ),
+            ]
+        ]
+    )
+
+    await notify_admins(
+        "💳 <b>New UPI Top-Up</b>\n\n"
+        f"User: {safe_text(username_text(message.from_user))}\n"
+        f"User ID: <code>{message.from_user.id}</code>\n"
+        f"Amount: ₹{money(amount)}\n"
+        f"Payment ID: <code>{payment_id}</code>",
+        reply_markup=keyboard,
+    )
 
     for admin_id in ADMIN_IDS:
         try:
-            admin_msg = (
-                "🚨 <b>NEW PAYMENT PROOF RECEIVED</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<b>User ID:</b> <code>{message.from_user.id}</code>\n"
-                f"<b>Username:</b> @{message.from_user.username or 'N/A'}\n"
-                f"<b>Method:</b> {coin}\n"
-                f"<b>System TX:</b> <code>{tx_id}</code>\n\n"
-                "Verify and click below to approve access:"
+            await bot.send_photo(
+                admin_id,
+                proof_file_id,
+                caption=(
+                    f"UPI proof\n"
+                    f"Payment: {payment_id}\n"
+                    f"User: {message.from_user.id}\n"
+                    f"Amount: ₹{money(amount)}"
+                ),
+                reply_markup=keyboard,
             )
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ APPROVE PAYMENT", callback_data=f"admin_approve_{message.from_user.id}_{plan_id}_{tx_id}")],
-                [InlineKeyboardButton(text="❌ REJECT PAYMENT", callback_data=f"admin_reject_{message.from_user.id}_{tx_id}")]
-            ])
-            
-            await message.bot.send_message(chat_id=admin_id, text=admin_msg)
-            if message.photo:
-                await message.bot.send_photo(chat_id=admin_id, photo=message.photo[-1].file_id, caption="📸 Payment Screenshot Proof")
-            elif message.text:
-                await message.bot.send_message(chat_id=admin_id, text=f"💬 <b>Proof Text / TX Hash:</b>\n<code>{html.quote(message.text)}</code>")
-        except Exception as e:
-            logger.error(f"Error forwarding proof to admin {admin_id}: {e}")
+        except Exception:
+            logger.exception("Failed sending UPI proof")
+
+    await state.clear()
 
     await message.answer(
-        "✅ <b>PAYMENT PROOF SUBMITTED!</b>\n\n"
-        "Your payment proof has been forwarded to our admins for verification. "
-        "Once verified, your invite link will be sent automatically.",
-        reply_markup=get_back_keyboard()
+        "Payment proof submitted successfully ✅\n"
+        "An administrator will verify it.",
+        reply_markup=main_menu(message.from_user.id),
     )
 
-@router.callback_query(F.data.startswith("admin_approve_"))
-async def admin_approve_payment(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    
-    parts = callback.data.split("_")
-    target_user_id = int(parts[2])
-    plan_id = int(parts[3])
-    tx_id = parts[4]
-    
-    plan = await db.get_plan(plan_id)
-    if not plan:
-        await callback.message.edit_text("❌ Plan no longer exists.")
+
+@router.message(UPIStates.proof)
+async def upi_proof_invalid(message: Message):
+    await message.answer(
+        "Please send the payment screenshot as a photo.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+# ============================================================
+# ADMIN PAYMENT APPROVAL
+# ============================================================
+
+@router.callback_query(F.data.startswith("payment:approve:"))
+async def approve_payment(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
         return
 
-    success = await grant_subscription_and_send_link(callback.bot, target_user_id, plan, tx_id)
-    if success:
-        await callback.message.edit_text(f"✅ Payment approved and invite link sent to User <code>{target_user_id}</code>.")
-    else:
-        await callback.message.edit_text("❌ Failed to issue invite link. Check bot permissions or invite pool.")
+    await call.answer()
 
-@router.callback_query(F.data.startswith("admin_reject_"))
-async def admin_reject_payment(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    
-    parts = callback.data.split("_")
-    target_user_id = int(parts[2])
-    tx_id = parts[3]
-    
-    await db.update_payment_status(tx_id, 'rejected')
+    payment_id = call.data.split(":")[-1]
+
+    payment = await db.payments.find_one_and_update(
+        {
+            "payment_id": payment_id,
+            "status": "pending",
+            "method": "upi",
+        },
+        {
+            "$set": {
+                "status": "approved",
+                "approved_by": call.from_user.id,
+                "approved_at": now(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not payment:
+        await call.message.answer(
+            "This payment is already processed or unavailable."
+        )
+        return
+
+    user_id = payment["user_id"]
+    amount = float(payment["amount"])
+
+    user = await db.users.find_one_and_update(
+        {"telegram_id": user_id},
+        {
+            "$inc": {"balances.inr": amount},
+            "$set": {"updated_at": now()},
+        },
+        return_document=ReturnDocument.BEFORE,
+    )
+
+    if not user:
+        await call.message.answer("User no longer exists.")
+        return
+
+    before = float(
+        user.get("balances", {}).get("inr", 0)
+    )
+    after = before + amount
+
+    await db.transactions.insert_one(
+        {
+            "user_id": user_id,
+            "type": "upi_topup",
+            "currency": "inr",
+            "amount": amount,
+            "balance_before": before,
+            "balance_after": after,
+            "reference": payment_id,
+            "status": "completed",
+            "created_at": now(),
+        }
+    )
+
+    await bot.send_message(
+        user_id,
+        f"✅ UPI top-up approved.\n\n"
+        f"Added: ₹{money(amount)}",
+    )
+
+    await call.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(F.data.startswith("payment:reject:"))
+async def reject_payment(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    payment_id = call.data.split(":")[-1]
+
+    payment = await db.payments.find_one_and_update(
+        {
+            "payment_id": payment_id,
+            "status": "pending",
+        },
+        {
+            "$set": {
+                "status": "rejected",
+                "rejected_by": call.from_user.id,
+                "rejected_at": now(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not payment:
+        await call.message.answer(
+            "This payment is already processed."
+        )
+        return
+
+    await bot.send_message(
+        payment["user_id"],
+        "❌ Your UPI top-up proof was rejected.\n"
+        "Please contact support if you believe this was an error.",
+    )
+
+    await call.message.edit_reply_markup(reply_markup=None)
+
+
+# ============================================================
+# OXAPAY
+# ============================================================
+
+async def create_oxapay_invoice(
+    amount: float,
+    order_id: str,
+    description: str,
+):
+    url = f"{OXAPAY_API_BASE}/payment/invoice"
+
+    payload = {
+        "amount": amount,
+        "currency": "USDT",
+        "lifetime": 60,
+        "callback_url": OXAPAY_WEBHOOK_URL,
+        "order_id": order_id,
+        "description": description,
+        "sandbox": False,
+    }
+
+    headers = {
+        "merchant_api_key": OXAPAY_MERCHANT_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            url,
+            json=payload,
+            headers=headers,
+        ) as response:
+            data = await response.json(content_type=None)
+
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"OxaPay HTTP {response.status}: {data}"
+                )
+
+            return data
+
+
+@router.callback_query(F.data == "topup:crypto")
+async def topup_crypto(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    await state.set_state(CryptoStates.amount)
+
+    await call.message.edit_text(
+        "Enter the USDT amount you want to add.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(CryptoStates.amount)
+async def crypto_amount(message: Message, state: FSMContext):
+    amount = parse_amount(message.text or "")
+
+    if not amount:
+        await message.answer(
+            "Enter a valid positive amount.",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    payment_id = await next_payment_id()
+    order_id = f"{payment_id}-{message.from_user.id}"
+
     try:
-        await callback.bot.send_message(
-            chat_id=target_user_id,
-            text="❌ <b>PAYMENT REJECTED</b>\n\nYour payment proof could not be verified. Please contact support."
+        result = await create_oxapay_invoice(
+            amount=amount,
+            order_id=order_id,
+            description=f"USDT wallet top-up for {message.from_user.id}",
+        )
+
+        # OxaPay v1 response normally contains data fields.
+        data = result.get("data", result)
+
+        track_id = (
+            data.get("track_id")
+            or data.get("trackId")
+        )
+
+        payment_url = (
+            data.get("payment_url")
+            or data.get("paymentUrl")
+            or data.get("pay_link")
+            or data.get("payLink")
+        )
+
+        if not track_id or not payment_url:
+            logger.error("Unexpected OxaPay response: %s", result)
+            raise RuntimeError("Invalid OxaPay response")
+
+        await db.payments.insert_one(
+            {
+                "payment_id": payment_id,
+                "user_id": message.from_user.id,
+                "method": "oxapay",
+                "order_id": order_id,
+                "track_id": str(track_id),
+                "amount": amount,
+                "currency": "USDT",
+                "status": "pending",
+                "created_at": now(),
+            }
+        )
+
+        await state.clear()
+
+        await message.answer(
+            f"💳 <b>Crypto Payment Created</b>\n\n"
+            f"Amount: {money(amount, 6)} USDT\n"
+            f"Order: <code>{order_id}</code>\n\n"
+            "Complete the payment using the button below.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Pay Now",
+                            url=payment_url,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Main Menu",
+                            callback_data="menu:main",
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    except Exception:
+        logger.exception("OxaPay invoice creation failed")
+
+        await message.answer(
+            "Unable to create the crypto payment right now. "
+            "Please try again later.",
+            reply_markup=cancel_keyboard(),
+        )
+
+
+@app.post(
+    "/webhook/oxapay",
+    response_class=PlainTextResponse,
+)
+async def oxapay_webhook(request: Request):
+    """
+    OxaPay signs the raw POST body using HMAC-SHA512
+    with the Merchant API Key.
+
+    The HMAC header must be checked against the raw body,
+    not reconstructed JSON.
+    """
+
+    raw_body = await request.body()
+    signature = request.headers.get("HMAC")
+
+    if not signature:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing HMAC",
+        )
+
+    calculated = hmac.new(
+        OXAPAY_MERCHANT_API_KEY.encode(),
+        raw_body,
+        hashlib.sha512,
+    ).hexdigest()
+
+    if not hmac.compare_digest(
+        calculated.lower(),
+        signature.lower(),
+    ):
+        logger.warning("Invalid OxaPay HMAC")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid HMAC",
+        )
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON",
+        )
+
+    if data.get("type") != "invoice":
+        return "ok"
+
+    status = str(data.get("status", "")).lower()
+    order_id = data.get("order_id")
+    track_id = str(data.get("track_id", ""))
+
+    if not order_id:
+        return "ok"
+
+    payment = await db.payments.find_one(
+        {
+            "order_id": order_id,
+            "method": "oxapay",
+        }
+    )
+
+    if not payment:
+        logger.warning(
+            "Unknown OxaPay order: %s",
+            order_id,
+        )
+        return "ok"
+
+    if track_id and payment.get("track_id") != track_id:
+        logger.warning("OxaPay track ID mismatch")
+        return "ok"
+
+    if status != "paid":
+        # Paying / other intermediate statuses are recorded,
+        # but they do not credit the wallet.
+        await db.payments.update_one(
+            {
+                "_id": payment["_id"],
+                "status": {"$ne": "paid"},
+            },
+            {
+                "$set": {
+                    "gateway_status": data.get("status"),
+                    "updated_at": now(),
+                }
+            },
+        )
+        return "ok"
+
+    # Idempotency: only pending payments can be credited.
+    updated = await db.payments.find_one_and_update(
+        {
+            "_id": payment["_id"],
+            "status": {"$ne": "paid"},
+        },
+        {
+            "$set": {
+                "status": "paid",
+                "gateway_status": data.get("status"),
+                "paid_at": now(),
+                "webhook_data": data,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated:
+        return "ok"
+
+    amount = float(payment["amount"])
+    user_id = int(payment["user_id"])
+
+    user = await db.users.find_one_and_update(
+        {"telegram_id": user_id},
+        {
+            "$inc": {"balances.usdt": amount},
+            "$set": {"updated_at": now()},
+        },
+        return_document=ReturnDocument.BEFORE,
+    )
+
+    if not user:
+        logger.error(
+            "OxaPay payment user missing: %s",
+            user_id,
+        )
+        return "ok"
+
+    before = float(
+        user.get("balances", {}).get("usdt", 0)
+    )
+    after = before + amount
+
+    await db.transactions.insert_one(
+        {
+            "user_id": user_id,
+            "type": "oxapay_topup",
+            "currency": "usdt",
+            "amount": amount,
+            "balance_before": before,
+            "balance_after": after,
+            "reference": order_id,
+            "status": "completed",
+            "created_at": now(),
+        }
+    )
+
+    try:
+        await bot.send_message(
+            user_id,
+            "✅ Crypto payment confirmed.\n\n"
+            f"Added: {money(amount, 6)} USDT",
         )
     except Exception:
-        pass
-    
-    await callback.message.edit_text(f"🔴 Payment rejected for User <code>{target_user_id}</code>.")
+        logger.exception("Unable to notify OxaPay user")
 
-@router.callback_query(F.data.startswith("admin_free_test_"))
-async def admin_free_test_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("Unauthorized!", show_alert=True)
-        return
-    
-    await callback.answer("⚡ Processing Admin Free Pass...")
-    plan_id = int(callback.data.split("_")[3])
-    plan = await db.get_plan(plan_id)
-    
-    tx_id = f"ADMIN-FREE-{callback.from_user.id}-{int(datetime.now(timezone.utc).timestamp())}"
-    await db.create_payment_record(callback.from_user.id, plan_id, tx_id, 0.0, "FREE")
-    
-    success = await grant_subscription_and_send_link(callback.bot, callback.from_user.id, plan, tx_id)
-    if success:
-        await callback.message.answer("🧪 <b>ADMIN TEST SUCCESSFUL</b>\nYour free test invite link has been delivered.")
-
-@router.callback_query(F.data.startswith("pay_plan_stars_"))
-async def pay_plan_stars_callback(callback: CallbackQuery):
-    await callback.answer()
-    plan_id = int(callback.data.split("_")[3])
-    plan = await db.get_plan(plan_id)
-
-    if not plan or not plan['active']:
-        await callback.message.edit_text("❌ Plan is no longer available.", reply_markup=get_back_keyboard("user_buy"))
-        return
-
-    tx_id = f"STARS-{callback.from_user.id}-{plan['id']}-{int(datetime.now(timezone.utc).timestamp())}"
-    await db.create_payment_record(callback.from_user.id, plan['id'], tx_id, plan['price'], plan['currency'])
-
-    title = f"Subscription: {plan['name']}"
-    description = f"Access for {plan['duration_value']} {plan['duration_unit']}"
-
-    prices = [LabeledPrice(label=title, amount=int(plan['price']))]
-    await callback.bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=title,
-        description=description,
-        payload=tx_id,
-        provider_token="",
-        currency="XTR",
-        prices=prices
+    await notify_admins(
+        "💵 <b>OxaPay Payment Confirmed</b>\n\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Amount: {money(amount, 6)} USDT\n"
+        f"Order: <code>{order_id}</code>"
     )
 
-@router.pre_checkout_query()
-async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
-    await pre_checkout_query.answer(ok=True)
+    return "ok"
 
-@router.message(F.successful_payment)
-async def process_successful_payment_handler(message: Message):
-    pmt = message.successful_payment
-    tx_id = pmt.invoice_payload
-    
-    payment_rec = await db.get_payment_by_provider_id(tx_id)
-    if payment_rec:
-        plan = await db.get_plan(payment_rec['plan_id'])
-        if plan:
-            await grant_subscription_and_send_link(message.bot, message.from_user.id, plan, tx_id)
 
-# --- ADMIN PANEL HANDLERS ---
+# ============================================================
+# STARS WALLET TOP-UP
+# ============================================================
 
-@router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext):
-    await state.clear()
-    if not is_admin_user(message.from_user.id):
-        await message.answer("❌ Unauthorized access.")
-        return
-    text = "🛠 <b>ADMIN CONTROL PANEL</b>\n━━━━━━━━━━━━━━━━━━━━━"
-    await message.answer(text, reply_markup=get_admin_menu_keyboard())
+@router.callback_query(F.data == "topup:stars")
+async def topup_stars(call: CallbackQuery, state: FSMContext):
+    await call.answer()
 
-@router.callback_query(F.data == "admin_main")
-async def admin_main_callback(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    text = "🛠 <b>ADMIN CONTROL PANEL</b>\n━━━━━━━━━━━━━━━━━━━━━"
-    await callback.message.edit_text(text, reply_markup=get_admin_menu_keyboard())
+    await state.set_state(StarsTopUpStates.amount)
 
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    
-    stats = await db.get_stats()
-    text = (
-        "📊 <b>BOT STATISTICS OVERVIEW</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👥 <b>Total Users:</b> {stats['total_users']}\n"
-        f"🟢 <b>Active Subscriptions:</b> {stats['active_subs']}\n"
-        f"⏰ <b>Expired Subscriptions:</b> {stats['expired_subs']}\n"
-        f"📦 <b>Active Plans:</b> {stats['total_plans']}\n"
-        f"🔗 <b>Available Pool Invites:</b> {stats['pool_links']}\n\n"
-        "💵 <b>FINANCIAL METRICS</b>\n"
-        f"💰 <b>Total Payments:</b> {stats['total_payments']}\n"
-        f"📈 <b>Total Revenue:</b> {stats['total_revenue']}\n"
-        f"📊 <b>Today Payments:</b> {stats['today_payments']}"
-    )
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard("admin_main"))
-
-@router.callback_query(F.data == "admin_bulk_invites")
-async def admin_bulk_invites_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    await state.set_state(AdminBulkInviteStates.waiting_links)
-    await callback.message.edit_text(
-        "🔗 <b>ADD BULK INVITE LINKS</b>\n\n"
-        "Send multiple invite links separated by newline or space:\n\n"
-        "<code>https://t.me/+ExampleLink1\nhttps://t.me/+ExampleLink2</code>",
-        reply_markup=get_back_keyboard("admin_main")
+    await call.message.edit_text(
+        "Enter the number of Telegram Stars you want to add.",
+        reply_markup=cancel_keyboard(),
     )
 
-@router.message(AdminBulkInviteStates.waiting_links)
-async def process_bulk_invite_links(message: Message, state: FSMContext):
-    links = [line.strip() for line in message.text.split() if "t.me" in line]
-    if not links:
-        await message.answer("❌ No valid Telegram invite links found. Try again.")
-        return
-        
-    added_count = await db.add_bulk_invites(links)
-    await state.clear()
-    await message.answer(
-        f"✅ <b>BULK INVITES ADDED</b>\n\nSuccessfully added {added_count} unique invite link(s) to the storage pool.",
-        reply_markup=get_back_keyboard("admin_main")
-    )
 
-@router.callback_query(F.data == "admin_plans")
-async def admin_plans_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    
-    plans = await db.get_all_plans()
-    text = "📦 <b>MANAGE SUBSCRIPTION PLANS</b>\n\nSelect a plan to configure or create a new one:"
-    
-    buttons = [
-        [InlineKeyboardButton(text="➕ Add New Plan", callback_data="admin_add_plan")]
-    ]
-    for p in plans:
-        status_icon = "🟢" if p['active'] else "🔴"
-        sym = "⭐" if p['currency'] == "XTR" else "$"
-        buttons.append([InlineKeyboardButton(
-            text=f"{status_icon} {p['name']} ({sym}{p['price']} {p['currency']})",
-            callback_data=f"admin_manage_plan_{p['id']}"
-        )])
-    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_main")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@router.callback_query(F.data == "admin_add_plan")
-async def admin_add_plan_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    await state.set_state(AdminPlanStates.waiting_name)
-    await callback.message.edit_text(
-        "➕ <b>CREATE PLAN (Step 1/6)</b>\n\nEnter the title for this subscription plan (e.g., <code>VIP Pass 30 Days</code>):",
-        reply_markup=get_back_keyboard("admin_plans")
-    )
-
-@router.message(AdminPlanStates.waiting_name)
-async def process_plan_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await state.set_state(AdminPlanStates.waiting_price)
-    await message.answer("💰 <b>CREATE PLAN (Step 2/6)</b>\n\nEnter price (numeric, e.g., <code>100</code> for Stars or <code>9.99</code>):")
-
-@router.message(AdminPlanStates.waiting_price)
-async def process_plan_price(message: Message, state: FSMContext):
+@router.message(StarsTopUpStates.amount)
+async def stars_topup_amount(message: Message, state: FSMContext):
     try:
-        price = float(message.text.strip())
-        if price <= 0: raise ValueError()
-        await state.update_data(price=price)
-        await state.set_state(AdminPlanStates.waiting_currency)
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ Telegram Stars (XTR)", callback_data="curr_XTR")],
-            [InlineKeyboardButton(text="💵 USD (Crypto / Fiat)", callback_data="curr_USD")]
-        ])
-        await message.answer("💱 <b>CREATE PLAN (Step 3/6)</b>\n\nSelect plan currency:", reply_markup=kb)
+        stars = int((message.text or "").strip())
+        if stars <= 0:
+            raise ValueError
     except ValueError:
-        await message.answer("❌ Invalid price. Enter a positive number.")
-
-@router.callback_query(AdminPlanStates.waiting_currency, F.data.startswith("curr_"))
-async def process_plan_currency(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    currency = callback.data.split("_")[1]
-    await state.update_data(currency=currency)
-    await state.set_state(AdminPlanStates.waiting_duration_val)
-    await callback.message.edit_text("⏱ <b>CREATE PLAN (Step 4/6)</b>\n\nEnter duration amount (integer, e.g., <code>30</code>):")
-
-@router.message(AdminPlanStates.waiting_duration_val)
-async def process_plan_dur_val(message: Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) <= 0:
-        await message.answer("❌ Enter a valid integer for duration.")
-        return
-    await state.update_data(duration_val=int(message.text))
-    await state.set_state(AdminPlanStates.waiting_duration_unit)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="Minutes", callback_data="unit_minutes"),
-            InlineKeyboardButton(text="Hours", callback_data="unit_hours")
-        ],
-        [
-            InlineKeyboardButton(text="Days", callback_data="unit_days"),
-            InlineKeyboardButton(text="Weeks", callback_data="unit_weeks")
-        ],
-        [
-            InlineKeyboardButton(text="Months", callback_data="unit_months"),
-            InlineKeyboardButton(text="Years", callback_data="unit_years")
-        ]
-    ])
-    await message.answer("⏱ <b>CREATE PLAN (Step 5/6)</b>\n\nSelect time unit:", reply_markup=kb)
-
-@router.callback_query(AdminPlanStates.waiting_duration_unit, F.data.startswith("unit_"))
-async def process_plan_dur_unit(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    unit = callback.data.split("_")[1]
-    await state.update_data(duration_unit=unit)
-    await state.set_state(AdminPlanStates.waiting_description)
-    await callback.message.edit_text("📝 <b>CREATE PLAN (Step 6/6)</b>\n\nEnter plan description:")
-
-@router.message(AdminPlanStates.waiting_description)
-async def process_plan_desc(message: Message, state: FSMContext):
-    await state.update_data(description=message.text.strip())
-    data = await state.get_data()
-    dur_sec = parse_duration_to_seconds(data['duration_val'], data['duration_unit'])
-    await state.update_data(duration_sec=dur_sec)
-
-    text = (
-        "<b>CONFIRM PLAN CREATION</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 <b>Name:</b> {html.quote(data['name'])}\n"
-        f"💰 <b>Price:</b> {data['price']} {data['currency']}\n"
-        f"⏱ <b>Duration:</b> {data['duration_val']} {data['duration_unit'].capitalize()}\n"
-        f"📝 <b>Description:</b> {html.quote(data['description'])}"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ CONFIRM & SAVE", callback_data="confirm_create_plan")],
-        [InlineKeyboardButton(text="❌ CANCEL", callback_data="admin_plans")]
-    ])
-    await state.set_state(AdminPlanStates.confirmation)
-    await message.answer(text, reply_markup=kb)
-
-@router.callback_query(AdminPlanStates.confirmation, F.data == "confirm_create_plan")
-async def confirm_create_plan(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    data = await state.get_data()
-    
-    await db.create_plan(
-        name=data['name'],
-        price=data['price'],
-        currency=data['currency'],
-        duration_val=data['duration_val'],
-        duration_unit=data['duration_unit'],
-        duration_sec=data['duration_sec'],
-        description=data['description']
-    )
-    await state.clear()
-    await callback.message.edit_text("✅ Plan created successfully!", reply_markup=get_back_keyboard("admin_plans"))
-
-@router.callback_query(F.data.startswith("admin_manage_plan_"))
-async def manage_plan_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    plan_id = int(callback.data.split("_")[3])
-    plan = await db.get_plan(plan_id)
-    if not plan:
-        await callback.message.edit_text("Plan not found.", reply_markup=get_back_keyboard("admin_plans"))
+        await message.answer(
+            "Enter a valid positive whole number of Stars.",
+            reply_markup=cancel_keyboard(),
+        )
         return
 
-    status_str = "🟢 Active" if plan['active'] else "🔴 Disabled"
-    text = (
-        f"📦 <b>PLAN DETAILS: {html.quote(plan['name'])}</b>\n\n"
-        f"<b>Status:</b> {status_str}\n"
-        f"<b>Price:</b> {plan['price']} {plan['currency']}\n"
-        f"<b>Duration:</b> {plan['duration_value']} {plan['duration_unit']}\n"
-        f"<b>Description:</b> {html.quote(plan['description'] or '')}"
-    )
-
-    toggle_txt = "🔴 Disable Plan" if plan['active'] else "🟢 Enable Plan"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle_txt, callback_data=f"admin_toggle_plan_{plan['id']}")],
-        [InlineKeyboardButton(text="🗑 Completely Delete Plan", callback_data=f"admin_delete_plan_{plan['id']}")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="admin_plans")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
-
-@router.callback_query(F.data.startswith("admin_toggle_plan_"))
-async def toggle_plan_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    plan_id = int(callback.data.split("_")[3])
-    await db.toggle_plan_status(plan_id)
-    await manage_plan_callback(callback)
-
-@router.callback_query(F.data.startswith("admin_delete_plan_"))
-async def delete_plan_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    plan_id = int(callback.data.split("_")[3])
-    await db.delete_plan(plan_id)
-    await callback.message.edit_text("✅ Plan completely deleted from database.", reply_markup=get_back_keyboard("admin_plans"))
-
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    await state.set_state(BroadcastStates.waiting_message)
-    await callback.message.edit_text(
-        "📢 <b>ADMIN BROADCAST</b>\n\nSend the message you want to broadcast to all registered users:",
-        reply_markup=get_back_keyboard("admin_main")
-    )
-
-@router.message(BroadcastStates.waiting_message)
-async def admin_broadcast_confirm(message: Message, state: FSMContext):
-    await state.update_data(broadcast_text=message.text)
-    await state.set_state(BroadcastStates.confirmation)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 START BROADCAST", callback_data="confirm_broadcast")],
-        [InlineKeyboardButton(text="❌ CANCEL", callback_data="admin_main")]
-    ])
-    await message.answer(f"⚠️ <b>CONFIRM BROADCAST</b>\n\nPreview:\n{message.text}", reply_markup=kb)
-
-@router.callback_query(BroadcastStates.confirmation, F.data == "confirm_broadcast")
-async def admin_broadcast_execute(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    data = await state.get_data()
-    text = data['broadcast_text']
     await state.clear()
 
-    user_ids = await db.get_all_user_ids()
-    await callback.message.edit_text(f"⏳ Broadcasting message to {len(user_ids)} users...")
+    # The configured conversion determines INR credit.
+    credited_inr = stars * STAR_TO_INR_RATE
 
-    success, failed = 0, 0
-    for uid in user_ids:
-        try:
-            await callback.bot.send_message(chat_id=uid, text=text)
-            success += 1
-            await asyncio.sleep(0.05)
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            try:
-                await callback.bot.send_message(chat_id=uid, text=text)
-                success += 1
-            except Exception:
-                failed += 1
-        except Exception:
-            failed += 1
-
-    await callback.message.answer(
-        f"📢 <b>BROADCAST COMPLETED</b>\n\n"
-        f"✅ <b>Successful:</b> {success}\n"
-        f"❌ <b>Failed:</b> {failed}",
-        reply_markup=get_back_keyboard("admin_main")
+    payload = (
+        f"topup|stars|{message.from_user.id}|"
+        f"{stars}|{credited_inr}"
     )
 
-@router.callback_query(F.data == "admin_users")
-async def admin_users_callback(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    await state.set_state(AdminUserSearchStates.waiting_query)
-    await callback.message.edit_text(
-        "👥 <b>USER MANAGEMENT</b>\n\nEnter Telegram User ID to search database:",
-        reply_markup=get_back_keyboard("admin_main")
-    )
-
-@router.message(AdminUserSearchStates.waiting_query)
-async def admin_user_search_result(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("❌ Invalid User ID. Enter numeric ID.")
-        return
-
-    target_id = int(message.text)
-    user = await db.get_user(target_id)
-    if not user:
-        await message.answer("❌ User not found.", reply_markup=get_back_keyboard("admin_main"))
-        return
-
-    sub = await db.get_active_subscription(target_id)
-    status_str = "🟢 Active" if sub else "⚪ Inactive"
-
-    text = (
-        f"👤 <b>USER DETAILS</b>\n\n"
-        f"<b>ID:</b> <code>{user['telegram_id']}</code>\n"
-        f"<b>Name:</b> {html.quote(user['first_name'])}\n"
-        f"<b>Username:</b> @{user['username'] or 'N/A'}\n"
-        f"<b>Subscription:</b> {status_str}\n"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Extend Sub (+7 Days)", callback_data=f"admin_ext_sub_{target_id}")],
-        [InlineKeyboardButton(text="🔴 Revoke Access", callback_data=f"admin_revoke_sub_{target_id}")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="admin_main")]
-    ])
-    await message.answer(text, reply_markup=kb)
-
-@router.callback_query(F.data.startswith("admin_ext_sub_"))
-async def admin_ext_sub_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    target_id = int(callback.data.split("_")[3])
-    
-    plans = await db.get_active_plans()
-    plan_id = plans[0]['id'] if plans else 1
-    await db.add_or_extend_subscription(target_id, plan_id, duration_seconds=7*86400)
-    
-    await callback.message.edit_text(f"✅ Granted 7 days extension to user {target_id}.", reply_markup=get_back_keyboard("admin_main"))
-
-@router.callback_query(F.data.startswith("admin_revoke_sub_"))
-async def admin_revoke_sub_callback(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id): return
-    await callback.answer()
-    target_id = int(callback.data.split("_")[3])
-    
-    await db.revoke_user_subscriptions(target_id)
     try:
-        await callback.bot.ban_chat_member(chat_id=CHANNEL_ID, user_id=target_id)
-        await callback.bot.unban_chat_member(chat_id=CHANNEL_ID, user_id=target_id)
-    except Exception as e:
-        logger.error(f"Failed kicking user {target_id}: {e}")
+        await bot.send_invoice(
+            chat_id=message.from_user.id,
+            title="Wallet Top Up",
+            description=(
+                f"{stars} Telegram Stars wallet top-up"
+            ),
+            payload=payload,
+            currency="XTR",
+            prices=[
+                LabeledPrice(
+                    label="Wallet Top Up",
+                    amount=stars,
+                )
+            ],
+            provider_token="",
+        )
+    except Exception:
+        logger.exception("Stars topup invoice failed")
+        await message.answer(
+            "Unable to create Stars invoice.",
+            reply_markup=main_menu(message.from_user.id),
+        )
 
-    await callback.message.edit_text(f"🔴 Access revoked for user {target_id}.", reply_markup=get_back_keyboard("admin_main"))
 
-# =============================================================================
-# 5. EXPIRATION WORKER & MAIN ENTRY POINT
-# =============================================================================
+# Extend successful payment handler to support wallet Stars.
+# This second handler is intentionally separated by a helper.
+@router.message(F.successful_payment)
+async def successful_stars_wallet_handler(message: Message):
+    payment = message.successful_payment
 
-async def expiration_worker(bot: Bot):
-    while True:
-        try:
-            expired_subs = await db.get_expired_subscriptions()
-            for sub in expired_subs:
-                user_id = sub['telegram_id']
-                sub_id = sub['id']
+    if not payment or payment.currency != "XTR":
+        return
 
-                await db.mark_subscription_expired(sub_id)
+    payload = payment.invoice_payload
 
-                try:
-                    await bot.ban_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-                    await bot.unban_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-                except Exception as e:
-                    logger.error(f"Error kicking user {user_id}: {e}")
+    if not payload.startswith("topup|stars|"):
+        return
 
-                try:
-                    exp_text = (
-                        "⏰ <b>SUBSCRIPTION EXPIRED</b>\n\n"
-                        "Your VIP channel access has expired. Please renew your subscription to continue."
+    parts = payload.split("|")
+
+    if len(parts) != 5:
+        return
+
+    try:
+        user_id = int(parts[2])
+        stars = int(parts[3])
+        credited_inr = float(parts[4])
+    except ValueError:
+        return
+
+    if user_id != message.from_user.id:
+        return
+
+    if payment.total_amount != stars:
+        return
+
+    existing = await db.payments.find_one(
+        {
+            "telegram_payment_charge_id":
+                payment.telegram_payment_charge_id
+        }
+    )
+
+    if existing:
+        return
+
+    payment_id = await next_payment_id()
+
+    await db.payments.insert_one(
+        {
+            "payment_id": payment_id,
+            "user_id": user_id,
+            "method": "stars_topup",
+            "amount": stars,
+            "currency": "XTR",
+            "credited_currency": "INR",
+            "credited_amount": credited_inr,
+            "status": "paid",
+            "telegram_payment_charge_id":
+                payment.telegram_payment_charge_id,
+            "provider_payment_charge_id":
+                payment.provider_payment_charge_id,
+            "created_at": now(),
+        }
+    )
+
+    user = await db.users.find_one_and_update(
+        {"telegram_id": user_id},
+        {
+            "$inc": {
+                "balances.inr": credited_inr,
+                "balances.stars": stars,
+            },
+            "$set": {
+                "updated_at": now(),
+            },
+        },
+        return_document=ReturnDocument.BEFORE,
+    )
+
+    if not user:
+        return
+
+    before = float(
+        user.get("balances", {}).get("inr", 0)
+    )
+
+    await db.transactions.insert_one(
+        {
+            "user_id": user_id,
+            "type": "stars_topup",
+            "currency": "inr",
+            "amount": credited_inr,
+            "balance_before": before,
+            "balance_after": before + credited_inr,
+            "reference": payment.telegram_payment_charge_id,
+            "stars_amount": stars,
+            "status": "completed",
+            "created_at": now(),
+        }
+    )
+
+    await message.answer(
+        "✅ Stars top-up successful.\n\n"
+        f"Stars received: {stars} ⭐\n"
+        f"INR credited: ₹{money(credited_inr)}",
+        reply_markup=main_menu(user_id),
+    )
+
+
+# ============================================================
+# MY PURCHASES
+# ============================================================
+
+async def show_purchases(user_id: int, target: Message):
+    purchases = await (
+        db.purchases.find(
+            {"user_id": user_id}
+        )
+        .sort("created_at", DESCENDING)
+        .limit(20)
+        .to_list(length=20)
+    )
+
+    if not purchases:
+        await target.edit_text(
+            "📦 You have no purchases yet.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    rows = []
+
+    for purchase in purchases:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=purchase.get(
+                        "pack_name",
+                        purchase["pack_id"],
+                    )[:30],
+                    callback_data=(
+                        f"purchase:view:"
+                        f"{purchase['purchase_id']}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Back",
+                callback_data="menu:main",
+            )
+        ]
+    )
+
+    text = "📦 <b>My Purchases</b>\n\n"
+
+    for purchase in purchases:
+        text += (
+            f"📦 {safe_text(purchase.get('pack_name'))}\n"
+            f"Purchased: {purchase.get('created_at')}\n"
+            f"Payment: {safe_text(purchase.get('payment_method'))}\n\n"
+        )
+
+    await target.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("purchase:view:"))
+async def purchase_view(call: CallbackQuery):
+    await call.answer()
+
+    purchase_id = call.data.split(":")[-1]
+
+    purchase = await db.purchases.find_one(
+        {
+            "purchase_id": purchase_id,
+            "user_id": call.from_user.id,
+        }
+    )
+
+    if not purchase:
+        await call.message.answer("Purchase not found.")
+        return
+
+    await call.message.edit_text(
+        "📦 <b>Purchase Details</b>\n\n"
+        f"Pack: {safe_text(purchase.get('pack_name'))}\n"
+        f"Purchase ID: <code>{purchase_id}</code>\n"
+        f"Amount: {purchase.get('amount')} "
+        f"{purchase.get('currency')}\n"
+        f"Payment: {safe_text(purchase.get('payment_method'))}\n"
+        f"Photos: {purchase.get('photos_count', 0)}\n"
+        f"Videos: {purchase.get('videos_count', 0)}\n"
+        f"Date: {purchase.get('created_at')}",
+        reply_markup=back_menu(),
+    )
+
+
+# ============================================================
+# APPOINTMENTS
+# ============================================================
+
+async def start_appointment(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+    await state.set_state(AppointmentStates.name)
+
+    await message.answer(
+        "Please enter your name.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AppointmentStates.name)
+async def appointment_name(
+    message: Message,
+    state: FSMContext,
+):
+    await state.update_data(name=(message.text or "")[:200])
+    await state.set_state(AppointmentStates.date)
+
+    await message.answer(
+        "Choose your preferred date.\n"
+        "Example: 25 September 2026",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AppointmentStates.date)
+async def appointment_date(
+    message: Message,
+    state: FSMContext,
+):
+    await state.update_data(date=(message.text or "")[:100])
+    await state.set_state(AppointmentStates.time)
+
+    await message.answer(
+        "Choose your preferred time.\n"
+        "Example: 6:30 PM",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AppointmentStates.time)
+async def appointment_time(
+    message: Message,
+    state: FSMContext,
+):
+    await state.update_data(time=(message.text or "")[:100])
+    await state.set_state(AppointmentStates.description)
+
+    await message.answer(
+        "Describe what you need.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AppointmentStates.description)
+async def appointment_description(
+    message: Message,
+    state: FSMContext,
+):
+    await state.update_data(
+        description=(message.text or "")[:2000]
+    )
+
+    data = await state.get_data()
+
+    await state.set_state(AppointmentStates.confirmation)
+
+    await message.answer(
+        "<b>Appointment Request</b>\n\n"
+        f"Name: {safe_text(data['name'])}\n"
+        f"Date: {safe_text(data['date'])}\n"
+        f"Time: {safe_text(data['time'])}\n"
+        f"Description: {safe_text(data['description'])}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Confirm",
+                        callback_data="appointment:confirm",
+                    ),
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data="flow:cancel",
+                    ),
+                ]
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data == "appointment:confirm",
+    AppointmentStates.confirmation,
+)
+async def appointment_confirm(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    await call.answer()
+
+    data = await state.get_data()
+
+    appointment_id = await db.counters.find_one_and_update(
+        {"_id": "appointments"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    appointment_number = (
+        f"APT-{int(appointment_id['value']):06d}"
+    )
+
+    await db.appointments.insert_one(
+        {
+            "appointment_id": appointment_number,
+            "user_id": call.from_user.id,
+            "username": call.from_user.username,
+            "name": data["name"],
+            "date": data["date"],
+            "time": data["time"],
+            "description": data["description"],
+            "status": "pending",
+            "created_at": now(),
+        }
+    )
+
+    await notify_admins(
+        "📅 <b>New Appointment Request</b>\n\n"
+        f"ID: <code>{appointment_number}</code>\n"
+        f"User: {safe_text(username_text(call.from_user))}\n"
+        f"User ID: <code>{call.from_user.id}</code>\n"
+        f"Date: {safe_text(data['date'])}\n"
+        f"Time: {safe_text(data['time'])}\n\n"
+        f"Description:\n{safe_text(data['description'])}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Accept",
+                        callback_data=(
+                            f"appointment:accept:"
+                            f"{appointment_number}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        text="Reject",
+                        callback_data=(
+                            f"appointment:reject:"
+                            f"{appointment_number}"
+                        ),
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Contact User",
+                        callback_data=(
+                            f"appointment:contact:"
+                            f"{appointment_number}"
+                        ),
                     )
-                    kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="💎 BUY ACCESS", callback_data="user_buy")]
-                    ])
-                    await bot.send_message(chat_id=user_id, text=exp_text, reply_markup=kb)
-                except Exception as e:
-                    logger.error(f"Failed to notify user {user_id}: {e}")
+                ],
+            ]
+        ),
+    )
 
-        except Exception as e:
-            logger.error(f"Error in background worker: {e}")
+    await state.clear()
 
-        await asyncio.sleep(CHECK_INTERVAL)
+    await call.message.edit_text(
+        "Appointment request submitted successfully ✅",
+        reply_markup=main_menu(call.from_user.id),
+    )
+
+
+# ============================================================
+# ADMIN APPOINTMENTS
+# ============================================================
+
+@router.callback_query(F.data.startswith("appointment:accept:"))
+async def appointment_accept(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    appointment_id = call.data.split(":")[-1]
+
+    appointment = await db.appointments.find_one_and_update(
+        {
+            "appointment_id": appointment_id,
+            "status": "pending",
+        },
+        {
+            "$set": {
+                "status": "accepted",
+                "handled_by": call.from_user.id,
+                "handled_at": now(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if appointment:
+        await bot.send_message(
+            appointment["user_id"],
+            "✅ Your appointment request has been accepted.",
+        )
+
+    await call.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(F.data.startswith("appointment:reject:"))
+async def appointment_reject(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    appointment_id = call.data.split(":")[-1]
+
+    appointment = await db.appointments.find_one_and_update(
+        {
+            "appointment_id": appointment_id,
+            "status": "pending",
+        },
+        {
+            "$set": {
+                "status": "rejected",
+                "handled_by": call.from_user.id,
+                "handled_at": now(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if appointment:
+        await bot.send_message(
+            appointment["user_id"],
+            "❌ Your appointment request was rejected.",
+        )
+
+    await call.message.edit_reply_markup(reply_markup=None)
+
+
+# ============================================================
+# SUPPORT
+# ============================================================
+
+async def start_support(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+    await state.set_state(SupportStates.chatting)
+
+    await message.answer(
+        "💬 <b>Direct Talk</b>\n\n"
+        "Send your message and it will be forwarded to the admin.\n"
+        "Use /start to leave support mode.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(SupportStates.chatting)
+async def support_message(
+    message: Message,
+    state: FSMContext,
+):
+    if not message.text:
+        await message.answer(
+            "Please send your support message as text."
+        )
+        return
+
+    support_id = await db.counters.find_one_and_update(
+        {"_id": "support"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    conversation_id = (
+        f"SUP-{int(support_id['value']):08d}"
+    )
+
+    await db.support_messages.insert_one(
+        {
+            "conversation_id": conversation_id,
+            "user_id": message.from_user.id,
+            "sender": "user",
+            "text": message.text[:4000],
+            "created_at": now(),
+        }
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Reply",
+                    callback_data=(
+                        f"support:reply:"
+                        f"{message.from_user.id}"
+                    ),
+                )
+            ]
+        ]
+    )
+
+    await notify_admins(
+        "💬 <b>New Support Message</b>\n\n"
+        f"User: {safe_text(username_text(message.from_user))}\n"
+        f"User ID: <code>{message.from_user.id}</code>\n\n"
+        f"{safe_text(message.text)}",
+        reply_markup=keyboard,
+    )
+
+    await message.answer(
+        "Message sent to admin ✅\n"
+        "You can send another message.",
+    )
+
+
+@router.callback_query(F.data.startswith("support:reply:"))
+async def support_reply_start(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    user_id = int(call.data.split(":")[-1])
+
+    await state.update_data(
+        support_target_user_id=user_id
+    )
+
+    await state.set_state(SupportStates.chatting)
+
+    await call.message.answer(
+        f"Send your reply for user <code>{user_id}</code>."
+    )
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
+@router.callback_query(F.data == "flow:cancel")
+async def cancel_flow(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    await call.answer()
+
+    await state.clear()
+
+    await call.message.edit_text(
+        "Operation cancelled.",
+        reply_markup=main_menu(call.from_user.id),
+    )
+
+
+# ============================================================
+# ADMIN PANEL
+# ============================================================
+
+@router.callback_query(F.data == "admin:panel")
+async def admin_panel(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    await call.message.edit_text(
+        "<b>Admin Panel</b>",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+# ============================================================
+# ADD PACK
+# ============================================================
+
+@router.callback_query(F.data == "admin:add_pack")
+async def admin_add_pack(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    await state.clear()
+    await state.set_state(AddPackStates.name)
+    await state.update_data(media=[])
+
+    await call.message.edit_text(
+        "Enter pack name:",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.name)
+async def add_pack_name(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    name = (message.text or "").strip()
+
+    if not name:
+        await message.answer("Enter a valid pack name.")
+        return
+
+    await state.update_data(name=name[:100])
+    await state.set_state(AddPackStates.description)
+
+    await message.answer(
+        "Enter pack description:",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.description)
+async def add_pack_description(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.update_data(
+        description=(message.text or "")[:2000]
+    )
+
+    await state.set_state(AddPackStates.media)
+
+    await message.answer(
+        "How would you like to add media?",
+        reply_markup=media_keyboard(),
+    )
+
+
+# ============================================================
+# MEDIA ADMIN FLOW
+# ============================================================
+
+@router.callback_query(
+    F.data == "packmedia:photo",
+    AddPackStates.media,
+)
+async def pack_add_photo(call: CallbackQuery):
+    await call.answer()
+
+    await call.message.edit_text(
+        "Send a photo now.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "packmedia:video",
+    AddPackStates.media,
+)
+async def pack_add_video(call: CallbackQuery):
+    await call.answer()
+
+    await call.message.edit_text(
+        "Send a video now.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "packmedia:channel",
+    AddPackStates.media,
+)
+async def pack_add_channel(call: CallbackQuery):
+    await call.answer()
+
+    await call.message.edit_text(
+        "Send an authorized channel post link.\n\n"
+        "Example:\n"
+        "<code>https://t.me/c/1234567890/123</code>",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.media, F.photo)
+async def add_pack_photo(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    media = data.get("media", [])
+
+    photo = message.photo[-1]
+
+    media.append(
+        {
+            "type": "photo",
+            "file_id": photo.file_id,
+            "file_unique_id": photo.file_unique_id,
+            "source": "upload",
+            "created_at": now(),
+        }
+    )
+
+    await state.update_data(media=media)
+
+    photos = sum(
+        1 for item in media
+        if item["type"] == "photo"
+    )
+    videos = sum(
+        1 for item in media
+        if item["type"] == "video"
+    )
+
+    await message.answer(
+        "Photo added successfully ✅\n\n"
+        f"📸 Photos: {photos}\n"
+        f"🎥 Videos: {videos}",
+        reply_markup=media_keyboard(),
+    )
+
+
+@router.message(AddPackStates.media, F.video)
+async def add_pack_video(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    media = data.get("media", [])
+
+    video = message.video
+
+    media.append(
+        {
+            "type": "video",
+            "file_id": video.file_id,
+            "file_unique_id": video.file_unique_id,
+            "source": "upload",
+            "created_at": now(),
+        }
+    )
+
+    await state.update_data(media=media)
+
+    photos = sum(
+        1 for item in media
+        if item["type"] == "photo"
+    )
+    videos = sum(
+        1 for item in media
+        if item["type"] == "video"
+    )
+
+    await message.answer(
+        "Video added successfully ✅\n\n"
+        f"📸 Photos: {photos}\n"
+        f"🎥 Videos: {videos}",
+        reply_markup=media_keyboard(),
+    )
+
+
+# ============================================================
+# CHANNEL LINK PARSER
+# ============================================================
+
+def parse_channel_post_link(link: str):
+    """
+    Supports:
+      https://t.me/c/1234567890/123
+      https://t.me/c/1234567890/123?...
+    """
+
+    link = link.strip()
+
+    match = re.match(
+        r"^https?://t\.me/c/(\d+)/(\d+)(?:\?.*)?$",
+        link,
+    )
+
+    if not match:
+        return None
+
+    internal_id = int(match.group(1))
+    message_id = int(match.group(2))
+
+    # Telegram's /c/ internal identifier maps to a supergroup/channel
+    # by prefixing -100.
+    channel_id = int(f"-100{internal_id}")
+
+    return channel_id, message_id
+
+
+@router.message(AddPackStates.media, F.text)
+async def add_pack_channel_link(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    parsed = parse_channel_post_link(message.text or "")
+
+    if not parsed:
+        await message.answer(
+            "Invalid channel post link.\n\n"
+            "Use a link such as:\n"
+            "<code>https://t.me/c/1234567890/123</code>",
+            reply_markup=media_keyboard(),
+        )
+        return
+
+    source_channel_id, message_id = parsed
+
+    if source_channel_id != CHANNEL_ID:
+        await message.answer(
+            "Rejected ❌\n\n"
+            "This post is not from the configured authorized "
+            "source channel.",
+            reply_markup=media_keyboard(),
+        )
+        return
+
+    # Check bot access to the authorized channel.
+    try:
+        member = await bot.get_chat_member(
+            CHANNEL_ID,
+            bot.id,
+        )
+
+        if member.status not in {
+            "administrator",
+            "creator",
+            "member",
+        }:
+            await message.answer(
+                "The bot does not have sufficient access "
+                "to the configured source channel.",
+                reply_markup=media_keyboard(),
+            )
+            return
+
+    except Exception:
+        logger.exception("Channel access check failed")
+
+        await message.answer(
+            "Unable to verify access to the configured channel.",
+            reply_markup=media_keyboard(),
+        )
+        return
+
+    # Telegram Bot API does not provide a generic "fetch arbitrary
+    # historical message by ID" method for bots.
+    #
+    # We therefore attempt copy_message from the authorized channel.
+    # This does not require downloading/re-uploading the media.
+    try:
+        copied = await bot.copy_message(
+            chat_id=message.from_user.id,
+            from_chat_id=CHANNEL_ID,
+            message_id=message_id,
+        )
+
+        data = await state.get_data()
+        media = data.get("media", [])
+
+        if copied.photo:
+            photo = copied.photo[-1]
+
+            media.append(
+                {
+                    "type": "photo",
+                    "file_id": photo.file_id,
+                    "file_unique_id": photo.file_unique_id,
+                    "source": "channel",
+                    "source_channel_id": CHANNEL_ID,
+                    "source_message_id": message_id,
+                    "created_at": now(),
+                }
+            )
+
+        elif copied.video:
+            video = copied.video
+
+            media.append(
+                {
+                    "type": "video",
+                    "file_id": video.file_id,
+                    "file_unique_id": video.file_unique_id,
+                    "source": "channel",
+                    "source_channel_id": CHANNEL_ID,
+                    "source_message_id": message_id,
+                    "created_at": now(),
+                }
+            )
+
+        else:
+            await message.answer(
+                "The channel post does not contain supported "
+                "photo/video media.",
+                reply_markup=media_keyboard(),
+            )
+            return
+
+        await state.update_data(media=media)
+
+        photos, videos = (
+            sum(1 for x in media if x["type"] == "photo"),
+            sum(1 for x in media if x["type"] == "video"),
+        )
+
+        await message.answer(
+            "Media added to this pack ✅\n\n"
+            f"📸 Photos: {photos}\n"
+            f"🎥 Videos: {videos}\n\n"
+            "Send another authorized channel post link or "
+            "choose an option.",
+            reply_markup=media_keyboard(),
+        )
+
+    except TelegramBadRequest:
+        logger.exception("Channel message copy failed")
+
+        await message.answer(
+            "Telegram could not access/copy that channel post.\n\n"
+            "Make sure the bot can access the configured channel "
+            "and the post is available to it.",
+            reply_markup=media_keyboard(),
+        )
+
+
+@router.callback_query(
+    F.data == "packmedia:finish",
+    AddPackStates.media,
+)
+async def finish_media(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    data = await state.get_data()
+    media = data.get("media", [])
+
+    if not media:
+        await call.message.answer(
+            "Add at least one photo or video before finishing."
+        )
+        return
+
+    await state.set_state(AddPackStates.price_inr)
+    await state.update_data(
+        price_inr=0,
+        price_usd=0,
+        price_usdt=0,
+        price_stars=0,
+    )
+
+    await call.message.edit_text(
+        "Set pack prices.\n\n"
+        "Choose a currency:",
+        reply_markup=price_keyboard(),
+    )
+
+
+# ============================================================
+# PACK PRICES
+# ============================================================
+
+@router.callback_query(
+    F.data == "packprice:inr",
+    AddPackStates.price_inr,
+)
+async def price_inr(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    await state.set_state(AddPackStates.price_inr)
+
+    await call.message.edit_text(
+        "Enter INR price.\n"
+        "Example: 499",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.price_inr)
+async def price_inr_value(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    amount = parse_amount(message.text or "")
+
+    if amount is None:
+        await message.answer(
+            "Enter a valid positive INR price."
+        )
+        return
+
+    await state.update_data(price_inr=amount)
+
+    await state.set_state(AddPackStates.price_usd)
+
+    await message.answer(
+        "Choose the next price field:",
+        reply_markup=price_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "packprice:usd",
+    AddPackStates.price_usd,
+)
+async def price_usd(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    await call.message.edit_text(
+        "Enter USD price.\n"
+        "Example: 5.99",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.price_usd)
+async def price_usd_value(
+    message: Message,
+    state: FSMContext,
+):
+    amount = parse_amount(message.text or "")
+
+    if amount is None:
+        await message.answer(
+            "Enter a valid positive USD price."
+        )
+        return
+
+    await state.update_data(price_usd=amount)
+
+    await state.set_state(AddPackStates.price_usdt)
+
+    await message.answer(
+        "Choose the next price field:",
+        reply_markup=price_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "packprice:usdt",
+    AddPackStates.price_usdt,
+)
+async def price_usdt(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    await call.message.edit_text(
+        "Enter USDT price.\n"
+        "Example: 5.50",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.price_usdt)
+async def price_usdt_value(
+    message: Message,
+    state: FSMContext,
+):
+    amount = parse_amount(message.text or "")
+
+    if amount is None:
+        await message.answer(
+            "Enter a valid positive USDT price."
+        )
+        return
+
+    await state.update_data(price_usdt=amount)
+
+    await state.set_state(AddPackStates.price_stars)
+
+    await message.answer(
+        "Choose the next price field:",
+        reply_markup=price_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "packprice:stars",
+    AddPackStates.price_stars,
+)
+async def price_stars(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    await call.message.edit_text(
+        "Enter Telegram Stars price.\n"
+        "Example: 350",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(AddPackStates.price_stars)
+async def price_stars_value(
+    message: Message,
+    state: FSMContext,
+):
+    try:
+        amount = int((message.text or "").strip())
+        if amount < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            "Enter a valid whole number of Stars."
+        )
+        return
+
+    await state.update_data(price_stars=amount)
+    await show_pack_preview(message, state)
+
+
+@router.callback_query(
+    F.data == "packprice:skip",
+)
+async def price_skip(call: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+
+    if current not in {
+        AddPackStates.price_inr.state,
+        AddPackStates.price_usd.state,
+        AddPackStates.price_usdt.state,
+        AddPackStates.price_stars.state,
+    }:
+        return
+
+    await call.answer()
+
+    data = await state.get_data()
+
+    current_state = current
+
+    if current_state == AddPackStates.price_inr.state:
+        await state.set_state(AddPackStates.price_usd)
+    elif current_state == AddPackStates.price_usd.state:
+        await state.set_state(AddPackStates.price_usdt)
+    elif current_state == AddPackStates.price_usdt.state:
+        await state.set_state(AddPackStates.price_stars)
+    else:
+        await show_pack_preview(call.message, state)
+        return
+
+    await call.message.edit_text(
+        "Choose the next price field:",
+        reply_markup=price_keyboard(),
+    )
+
+
+async def show_pack_preview(
+    message: Message,
+    state: FSMContext,
+):
+    data = await state.get_data()
+
+    media = data.get("media", [])
+
+    photos = sum(
+        1 for item in media
+        if item["type"] == "photo"
+    )
+
+    videos = sum(
+        1 for item in media
+        if item["type"] == "video"
+    )
+
+    await state.set_state(AddPackStates.preview)
+
+    await message.answer(
+        "<b>PACK PREVIEW</b>\n\n"
+        f"Name: {safe_text(data.get('name'))}\n\n"
+        f"Description:\n{safe_text(data.get('description'))}\n\n"
+        f"Photos: {photos}\n"
+        f"Videos: {videos}\n\n"
+        "<b>Prices</b>\n"
+        f"INR: ₹{money(data.get('price_inr', 0))}\n"
+        f"USD: ${money(data.get('price_usd', 0))}\n"
+        f"USDT: {money(data.get('price_usdt', 0), 6)}\n"
+        f"Stars: {int(data.get('price_stars', 0))}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Save Pack",
+                        callback_data="pack:save",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Edit",
+                        callback_data="pack:edit",
+                    ),
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data="flow:cancel",
+                    ),
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data == "pack:save",
+    AddPackStates.preview,
+)
+async def save_pack(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    data = await state.get_data()
+
+    pack_id = await next_pack_id()
+
+    document = {
+        "pack_id": pack_id,
+        "name": data["name"],
+        "description": data["description"],
+        "media": data.get("media", []),
+        "price_inr": float(data.get("price_inr", 0)),
+        "price_usd": float(data.get("price_usd", 0)),
+        "price_usdt": float(data.get("price_usdt", 0)),
+        "price_stars": int(data.get("price_stars", 0)),
+        "active": True,
+        "created_by": call.from_user.id,
+        "created_at": now(),
+        "updated_at": now(),
+    }
+
+    await db.packs.insert_one(document)
+    await state.clear()
+
+    await call.message.edit_text(
+        "Pack created successfully ✅\n\n"
+        f"Pack ID: <code>{pack_id}</code>",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "pack:edit",
+    AddPackStates.preview,
+)
+async def pack_edit(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    await call.answer()
+
+    await state.set_state(AddPackStates.name)
+
+    await call.message.edit_text(
+        "Enter the pack name again to edit it.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+# ============================================================
+# ADMIN PACK MANAGEMENT
+# ============================================================
+
+@router.callback_query(F.data == "admin:packs")
+async def admin_packs(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+    await show_admin_packs(call.message, 1)
+
+
+async def show_admin_packs(message: Message, page: int):
+    size = 5
+    skip = (page - 1) * size
+
+    total = await db.packs.count_documents({})
+
+    packs = await (
+        db.packs.find({})
+        .sort("created_at", DESCENDING)
+        .skip(skip)
+        .limit(size)
+        .to_list(length=size)
+    )
+
+    pages = max(1, (total + size - 1) // size)
+
+    if not packs:
+        await message.edit_text(
+            "No packs found.",
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    rows = []
+
+    text = "<b>Manage Packs</b>\n\n"
+
+    for pack in packs:
+        status = "Active" if pack.get("active") else "Disabled"
+
+        text += (
+            f"📦 <b>{safe_text(pack['name'])}</b>\n"
+            f"ID: <code>{pack['pack_id']}</code>\n"
+            f"Status: {status}\n\n"
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="View",
+                    callback_data=(
+                        f"adminpack:view:{pack['pack_id']}"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="Toggle",
+                    callback_data=(
+                        f"adminpack:toggle:{pack['pack_id']}"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="Delete",
+                    callback_data=(
+                        f"adminpack:delete:{pack['pack_id']}"
+                    ),
+                ),
+            ]
+        )
+
+    nav = []
+
+    if page > 1:
+        nav.append(
+            InlineKeyboardButton(
+                text="Previous",
+                callback_data=f"adminpacks:page:{page - 1}",
+            )
+        )
+
+    nav.append(
+        InlineKeyboardButton(
+            text=f"Page {page}/{pages}",
+            callback_data="noop",
+        )
+    )
+
+    if page < pages:
+        nav.append(
+            InlineKeyboardButton(
+                text="Next",
+                callback_data=f"adminpacks:page:{page + 1}",
+            )
+        )
+
+    rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Back",
+                callback_data="admin:panel",
+            )
+        ]
+    )
+
+    await message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("adminpacks:page:"))
+async def admin_packs_page(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    page = int(call.data.split(":")[-1])
+    await show_admin_packs(call.message, page)
+
+
+@router.callback_query(F.data.startswith("adminpack:view:"))
+async def admin_pack_view(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    pack_id = call.data.split(":")[-1]
+
+    pack = await db.packs.find_one(
+        {"pack_id": pack_id}
+    )
+
+    if not pack:
+        await call.message.answer("Pack not found.")
+        return
+
+    photos, videos = pack_media_counts(pack)
+
+    await call.message.edit_text(
+        f"<b>{safe_text(pack['name'])}</b>\n\n"
+        f"ID: <code>{pack['pack_id']}</code>\n"
+        f"Description: {safe_text(pack['description'])}\n\n"
+        f"Photos: {photos}\n"
+        f"Videos: {videos}\n"
+        f"INR: ₹{money(pack.get('price_inr'))}\n"
+        f"USD: ${money(pack.get('price_usd'))}\n"
+        f"USDT: {money(pack.get('price_usdt'), 6)}\n"
+        f"Stars: {pack.get('price_stars', 0)}\n"
+        f"Active: {pack.get('active', False)}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data="admin:packs",
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("adminpack:toggle:"))
+async def admin_pack_toggle(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    pack_id = call.data.split(":")[-1]
+
+    pack = await db.packs.find_one(
+        {"pack_id": pack_id}
+    )
+
+    if not pack:
+        return
+
+    await db.packs.update_one(
+        {"pack_id": pack_id},
+        {
+            "$set": {
+                "active": not pack.get("active", False),
+                "updated_at": now(),
+            }
+        },
+    )
+
+    await show_admin_packs(call.message, 1)
+
+
+@router.callback_query(F.data.startswith("adminpack:delete:"))
+async def admin_pack_delete_confirm(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    pack_id = call.data.split(":")[-1]
+
+    await call.message.edit_text(
+        f"Delete <code>{pack_id}</code> permanently?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Confirm Delete",
+                        callback_data=(
+                            f"adminpack:deleteconfirm:{pack_id}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data="admin:packs",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("adminpack:deleteconfirm:")
+)
+async def admin_pack_delete(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    pack_id = call.data.split(":")[-1]
+
+    await db.packs.delete_one(
+        {"pack_id": pack_id}
+    )
+
+    await call.message.edit_text(
+        "Pack deleted successfully.",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+# ============================================================
+# ADMIN USERS
+# ============================================================
+
+@router.callback_query(F.data == "admin:users")
+async def admin_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    users = await (
+        db.users.find({})
+        .sort("created_at", DESCENDING)
+        .limit(20)
+        .to_list(length=20)
+    )
+
+    text = "<b>Users</b>\n\n"
+
+    for user in users:
+        balances = user.get("balances", {})
+
+        text += (
+            f"ID: <code>{user['telegram_id']}</code>\n"
+            f"Username: {safe_text(user.get('username') or '-')} \n"
+            f"INR: ₹{money(balances.get('inr', 0))}\n"
+            f"USDT: {money(balances.get('usdt', 0), 6)}\n"
+            f"Blocked: {user.get('blocked', False)}\n\n"
+        )
+
+    await call.message.edit_text(
+        text[:4000],
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Add / Remove Balance",
+                        callback_data="admin:userbalance",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data="admin:panel",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "admin:userbalance")
+async def admin_user_balance(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    await state.set_state(BalanceAdminStates.user_id)
+
+    await call.message.edit_text(
+        "Enter the user's Telegram ID.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(BalanceAdminStates.user_id)
+async def admin_balance_user(
+    message: Message,
+    state: FSMContext,
+):
+    try:
+        user_id = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Enter a valid Telegram ID.")
+        return
+
+    user = await get_user(user_id)
+
+    if not user:
+        await message.answer("User not found.")
+        return
+
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(BalanceAdminStates.currency)
+
+    await message.answer(
+        "Choose currency.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="INR",
+                        callback_data="balancecur:inr",
+                    ),
+                    InlineKeyboardButton(
+                        text="USDT",
+                        callback_data="balancecur:usdt",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data="flow:cancel",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("balancecur:"),
+    BalanceAdminStates.currency,
+)
+async def admin_balance_currency(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    await call.answer()
+
+    currency = call.data.split(":")[-1]
+
+    await state.update_data(currency=currency)
+    await state.set_state(BalanceAdminStates.amount)
+
+    await call.message.edit_text(
+        f"Enter amount to add/remove in {currency.upper()}.\n\n"
+        "Use a positive number to add.\n"
+        "Use a negative number to remove.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(BalanceAdminStates.amount)
+async def admin_balance_amount(
+    message: Message,
+    state: FSMContext,
+):
+    try:
+        amount = float((message.text or "").strip())
+    except ValueError:
+        await message.answer("Enter a valid amount.")
+        return
+
+    data = await state.get_data()
+
+    user_id = int(data["target_user_id"])
+    currency = data["currency"]
+
+    field = f"balances.{currency}"
+
+    user = await db.users.find_one_and_update(
+        {"telegram_id": user_id},
+        {
+            "$inc": {field: amount},
+            "$set": {"updated_at": now()},
+        },
+        return_document=ReturnDocument.BEFORE,
+    )
+
+    if not user:
+        await message.answer("User not found.")
+        await state.clear()
+        return
+
+    before = float(
+        user.get("balances", {}).get(currency, 0)
+    )
+    after = before + amount
+
+    if after < 0:
+        # Reverse the operation.
+        await db.users.update_one(
+            {"telegram_id": user_id},
+            {"$inc": {field: -amount}},
+        )
+
+        await message.answer(
+            "Operation rejected because the balance cannot become negative."
+        )
+        return
+
+    await db.transactions.insert_one(
+        {
+            "user_id": user_id,
+            "type": "admin_balance_adjustment",
+            "currency": currency,
+            "amount": amount,
+            "balance_before": before,
+            "balance_after": after,
+            "reference": f"ADMIN:{message.from_user.id}",
+            "status": "completed",
+            "created_at": now(),
+        }
+    )
+
+    await bot.send_message(
+        user_id,
+        "💰 Your wallet balance was updated by an administrator.\n\n"
+        f"{currency.upper()}: {amount:+.6f}",
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "Balance updated successfully.",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+# ============================================================
+# ADMIN PAYMENT VERIFICATION LIST
+# ============================================================
+
+@router.callback_query(F.data == "admin:payments")
+async def admin_payments(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    payments = await (
+        db.payments.find(
+            {
+                "status": "pending",
+                "method": "upi",
+            }
+        )
+        .sort("created_at", DESCENDING)
+        .limit(20)
+        .to_list(length=20)
+    )
+
+    if not payments:
+        await call.message.edit_text(
+            "No pending manual payments.",
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    text = "<b>Pending UPI Payments</b>\n\n"
+
+    for payment in payments:
+        text += (
+            f"Payment: <code>{payment['payment_id']}</code>\n"
+            f"User: <code>{payment['user_id']}</code>\n"
+            f"Amount: ₹{money(payment['amount'])}\n\n"
+        )
+
+    await call.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data="admin:panel",
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+# ============================================================
+# ADMIN APPOINTMENTS LIST
+# ============================================================
+
+@router.callback_query(F.data == "admin:appointments")
+async def admin_appointments(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    appointments = await (
+        db.appointments.find({})
+        .sort("created_at", DESCENDING)
+        .limit(20)
+        .to_list(length=20)
+    )
+
+    text = "<b>Appointments</b>\n\n"
+
+    if not appointments:
+        text += "No appointments."
+
+    for appointment in appointments:
+        text += (
+            f"<b>{appointment['appointment_id']}</b>\n"
+            f"User: {appointment['user_id']}\n"
+            f"Date: {safe_text(appointment['date'])}\n"
+            f"Time: {safe_text(appointment['time'])}\n"
+            f"Status: {appointment['status']}\n\n"
+        )
+
+    await call.message.edit_text(
+        text[:4000],
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Back",
+                        callback_data="admin:panel",
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+# ============================================================
+# ADMIN STATISTICS
+# ============================================================
+
+@router.callback_query(F.data == "admin:stats")
+async def admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    users = await db.users.count_documents({})
+    packs = await db.packs.count_documents(
+        {"active": True}
+    )
+    purchases = await db.purchases.count_documents({})
+    pending = await db.payments.count_documents(
+        {"status": "pending"}
+    )
+
+    await call.message.edit_text(
+        "<b>Statistics</b>\n\n"
+        f"Users: {users}\n"
+        f"Active Packs: {packs}\n"
+        f"Purchases: {purchases}\n"
+        f"Pending Payments: {pending}",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+# ============================================================
+# ADMIN BROADCAST
+# ============================================================
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    await call.answer()
+
+    await state.set_state(BroadcastStates.message)
+
+    await call.message.edit_text(
+        "Send the broadcast message.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(BroadcastStates.message)
+async def admin_broadcast_message(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.text:
+        await message.answer(
+            "For this simple broadcast flow, send text."
+        )
+        return
+
+    users = db.users.find(
+        {
+            "blocked": {"$ne": True}
+        },
+        {
+            "telegram_id": 1
+        },
+    )
+
+    sent = 0
+
+    async for user in users:
+        try:
+            await bot.send_message(
+                user["telegram_id"],
+                message.text,
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    await state.clear()
+
+    await message.answer(
+        f"Broadcast completed.\nSent: {sent}",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+# ============================================================
+# ADMIN MEDIA FALLBACK
+# ============================================================
+
+@router.message(
+    F.photo | F.video,
+)
+async def unexpected_media(message: Message):
+    """
+    If an admin sends media while not in the Add Pack FSM,
+    explain how to use it rather than silently discarding it.
+    """
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "Media received. To add it to a pack, open "
+            "Admin Panel → Add Pack."
+        )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+@router.errors()
+async def global_error_handler(event):
+    logger.exception(
+        "Unhandled Telegram error: %s",
+        event.exception,
+    )
+
+    return True
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+async def init_db():
+    global mongo_client, db
+
+    mongo_client = AsyncIOMotorClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000,
+    )
+
+    db = mongo_client[DATABASE_NAME]
+
+    await db.command("ping")
+
+    # Required indexes.
+    await db.users.create_index(
+        [("telegram_id", ASCENDING)],
+        unique=True,
+    )
+
+    await db.packs.create_index(
+        [("pack_id", ASCENDING)],
+        unique=True,
+    )
+
+    await db.packs.create_index(
+        [("active", ASCENDING)]
+    )
+
+    await db.purchases.create_index(
+        [("user_id", ASCENDING)]
+    )
+
+    await db.purchases.create_index(
+        [("reference", ASCENDING)],
+        unique=True,
+    )
+
+    await db.payments.create_index(
+        [("user_id", ASCENDING)]
+    )
+
+    await db.payments.create_index(
+        [("status", ASCENDING)]
+    )
+
+    await db.payments.create_index(
+        [("order_id", ASCENDING)],
+        unique=True,
+        sparse=True,
+    )
+
+    await db.payments.create_index(
+        [("telegram_payment_charge_id", ASCENDING)],
+        unique=True,
+        sparse=True,
+    )
+
+    await db.payments.create_index(
+        [("track_id", ASCENDING)]
+    )
+
+    await db.appointments.create_index(
+        [("user_id", ASCENDING)]
+    )
+
+    await db.transactions.create_index(
+        [("user_id", ASCENDING)]
+    )
+
+    await db.support_messages.create_index(
+        [("user_id", ASCENDING)]
+    )
+
+    logger.info("MongoDB initialized successfully")
+
+
+# ============================================================
+# HEALTH ENDPOINT
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "telegram-pack-bot",
+    }
+
+
+@app.get("/health")
+async def health():
+    try:
+        await db.command("ping")
+        return {
+            "status": "healthy",
+            "database": "connected",
+        }
+    except Exception:
+        return {
+            "status": "unhealthy",
+            "database": "disconnected",
+        }
+
+
+# ============================================================
+# FASTAPI + AIROGRAM RUNNER
+# ============================================================
+
+async def run_http_server():
+    config = uvicorn.Config(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level="info",
+    )
+
+    server = uvicorn.Server(config)
+
+    await server.serve()
+
+
+async def run_bot():
+    logger.info("Starting Telegram polling...")
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+    )
+
 
 async def main():
-    await db.init_db()
+    await init_db()
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
-    asyncio.create_task(expiration_worker(bot))
-
-    logger.info("Bot starting long polling...")
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await asyncio.gather(
+            run_bot(),
+            run_http_server(),
+        )
     finally:
         await bot.session.close()
+
+        if mongo_client:
+            mongo_client.close()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    except KeyboardInterrupt:
+        logger.info("Application stopped.")
