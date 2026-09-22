@@ -172,35 +172,37 @@ def parse_amount(text: str) -> Optional[float]:
 def main_menu(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="Buy Pack", callback_data="menu:packs"),
-        ],
-        [
-            InlineKeyboardButton(text="Pay Money", callback_data="menu:money"),
+            InlineKeyboardButton(text="📦 Buy Pack", callback_data="menu:packs", style="success"),
+            InlineKeyboardButton(text="💳 Pay Money", callback_data="menu:money", style="primary"),
         ],
         [
             InlineKeyboardButton(
-                text="Book Custom Appointment",
+                text="📅 Book Custom Appointment",
                 callback_data="menu:appointment",
+                style="primary",
             ),
         ],
         [
             InlineKeyboardButton(
-                text="Direct Talk",
+                text="💬 Direct Talk",
                 callback_data="menu:support",
+                style="primary",
             ),
         ],
         [
-            InlineKeyboardButton(text="Wallet", callback_data="menu:wallet"),
-            InlineKeyboardButton(text="Top Up", callback_data="menu:topup"),
+            InlineKeyboardButton(text="👛 Wallet", callback_data="menu:wallet", style="primary"),
+            InlineKeyboardButton(text="⚡ Top Up", callback_data="menu:topup", style="success"),
         ],
         [
             InlineKeyboardButton(
-                text="My Purchases",
+                text="🛍️ My Purchases",
                 callback_data="menu:purchases",
+                style="primary",
             ),
             InlineKeyboardButton(
-                text="Help",
+                text="❓ Help",
                 callback_data="menu:help",
+                style="primary",
             ),
         ],
     ]
@@ -209,8 +211,9 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Admin Panel",
+                    text="⚙️ Admin Panel",
                     callback_data="admin:panel",
+                    style="danger",
                 )
             ]
         )
@@ -223,7 +226,7 @@ def back_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Back",
+                    text="⬅️ Back",
                     callback_data="menu:main",
                 )
             ]
@@ -236,9 +239,14 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Cancel",
+                    text="⬅️ Back",
+                    callback_data="menu:main",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Cancel",
                     callback_data="flow:cancel",
-                )
+                    style="danger",
+                ),
             ]
         ]
     )
@@ -403,43 +411,50 @@ def admin_panel_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Add Pack",
+                    text="➕ Add Pack",
                     callback_data="admin:add_pack",
+                    style="success",
                 ),
                 InlineKeyboardButton(
-                    text="Manage Packs",
+                    text="📦 Manage Packs",
                     callback_data="admin:packs",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Manage Users",
+                    text="👥 Manage Users",
                     callback_data="admin:users",
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Payment Verification",
+                    text="📑 Payment Verification",
                     callback_data="admin:payments",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Appointments",
+                    text="📅 Appointments",
                     callback_data="admin:appointments",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Broadcast",
+                    text="📢 Broadcast",
                     callback_data="admin:broadcast",
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Statistics",
+                    text="📊 Statistics",
                     callback_data="admin:stats",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Main Menu",
+                    text="⬅️ Main Menu",
                     callback_data="menu:main",
                 )
             ],
@@ -452,31 +467,40 @@ def media_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Add Photo",
+                    text="📸 Add Photo",
                     callback_data="packmedia:photo",
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Add Video",
+                    text="🎥 Add Video",
                     callback_data="packmedia:video",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Add From Channel",
+                    text="📢 Add From Channel",
                     callback_data="packmedia:channel",
+                    style="primary",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Finish Pack",
+                    text="✅ Finish Pack",
                     callback_data="packmedia:finish",
+                    style="success",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Cancel",
+                    text="⬅️ Back",
+                    callback_data="admin:panel",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Cancel",
                     callback_data="flow:cancel",
-                )
+                    style="danger",
+                ),
             ],
         ]
     )
@@ -487,35 +511,44 @@ def price_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="INR Price",
+                    text="🇮🇳 INR Price",
                     callback_data="packprice:inr",
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="USD Price",
+                    text="🇺🇸 USD Price",
                     callback_data="packprice:usd",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="USDT Price",
+                    text="💵 USDT Price",
                     callback_data="packprice:usdt",
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Stars Price",
+                    text="⭐ Stars Price",
                     callback_data="packprice:stars",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Skip",
+                    text="⏩ Skip",
                     callback_data="packprice:skip",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Cancel",
+                    text="⬅️ Back",
+                    callback_data="admin:panel",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Cancel",
                     callback_data="flow:cancel",
-                )
+                    style="danger",
+                ),
             ],
         ]
     )
@@ -526,17 +559,19 @@ def wallet_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Top Up",
+                    text="⚡ Top Up",
                     callback_data="menu:topup",
+                    style="success",
                 ),
                 InlineKeyboardButton(
-                    text="Transaction History",
+                    text="📜 Transaction History",
                     callback_data="wallet:history",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Back",
+                    text="⬅️ Back",
                     callback_data="menu:main",
                 )
             ],
@@ -549,23 +584,26 @@ def topup_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="UPI",
+                    text="🇮🇳 UPI",
                     callback_data="topup:upi",
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Crypto",
+                    text="💵 Crypto",
                     callback_data="topup:crypto",
+                    style="primary",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="Telegram Stars",
+                    text="⭐ Telegram Stars",
                     callback_data="topup:stars",
+                    style="primary",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Back",
+                    text="⬅️ Back",
                     callback_data="menu:main",
                 )
             ],
@@ -684,29 +722,33 @@ async def menu_money(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Add INR",
+                        text="🇮🇳 Add INR",
                         callback_data="topup:upi",
+                        style="success",
                     ),
                     InlineKeyboardButton(
-                        text="Add USDT",
+                        text="💵 Add USDT",
                         callback_data="topup:crypto",
+                        style="success",
                     ),
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Add Stars",
+                        text="⭐ Add Stars",
                         callback_data="topup:stars",
+                        style="success",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Wallet History",
+                        text="📜 Wallet History",
                         callback_data="wallet:history",
+                        style="primary",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data="menu:main",
                     )
                 ],
@@ -799,20 +841,12 @@ async def show_packs(message: Message, page: int = 1):
     for pack in packs:
         photos, videos = pack_media_counts(pack)
 
-        text = (
-            f"📦 <b>{safe_text(pack['name'])}</b>\n"
-            f"📸 {photos} Photos • 🎥 {videos} Videos\n"
-            f"₹{money(pack.get('price_inr', 0))} / "
-            f"${money(pack.get('price_usd', 0))} / "
-            f"{money(pack.get('price_usdt', 0), 6)} USDT / "
-            f"{int(pack.get('price_stars', 0))} ⭐"
-        )
-
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"View • {pack['name'][:25]}",
+                    text=f"👁️ View • {pack['name'][:25]}",
                     callback_data=f"pack:view:{pack['pack_id']}",
+                    style="primary",
                 )
             ]
         )
@@ -822,14 +856,14 @@ async def show_packs(message: Message, page: int = 1):
     if page > 1:
         navigation.append(
             InlineKeyboardButton(
-                text="Previous",
+                text="⬅️ Previous",
                 callback_data=f"packs:page:{page - 1}",
             )
         )
 
     navigation.append(
         InlineKeyboardButton(
-            text=f"Page {page}/{total_pages}",
+            text=f"📄 Page {page}/{total_pages}",
             callback_data="noop",
         )
     )
@@ -837,7 +871,7 @@ async def show_packs(message: Message, page: int = 1):
     if page < total_pages:
         navigation.append(
             InlineKeyboardButton(
-                text="Next",
+                text="Next ➡️",
                 callback_data=f"packs:page:{page + 1}",
             )
         )
@@ -846,7 +880,7 @@ async def show_packs(message: Message, page: int = 1):
     rows.append(
         [
             InlineKeyboardButton(
-                text="Back",
+                text="⬅️ Back",
                 callback_data="menu:main",
             )
         ]
@@ -925,13 +959,14 @@ async def pack_view(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Buy",
+                        text="🛒 Buy Now",
                         callback_data=f"pack:buy:{pack_id}",
+                        style="success",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data="menu:packs",
                     )
                 ],
@@ -967,29 +1002,33 @@ async def pack_buy(call: CallbackQuery):
                     InlineKeyboardButton(
                         text="⭐ Pay with Stars",
                         callback_data=f"pay:stars:{pack_id}",
+                        style="success",
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="💵 Pay with USDT Balance",
                         callback_data=f"pay:usdt:{pack_id}",
+                        style="success",
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="🇮🇳 Pay with INR Balance",
                         callback_data=f"pay:inr:{pack_id}",
+                        style="success",
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="💳 Top Up Wallet",
                         callback_data="menu:topup",
+                        style="primary",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data=f"pack:view:{pack_id}",
                     )
                 ],
@@ -1321,13 +1360,14 @@ async def pay_pack_usdt(call: CallbackQuery):
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Top Up USDT",
+                            text="💵 Top Up USDT",
                             callback_data="topup:crypto",
+                            style="success",
                         )
                     ],
                     [
                         InlineKeyboardButton(
-                            text="Back",
+                            text="⬅️ Back",
                             callback_data=f"pack:view:{pack_id}",
                         )
                     ],
@@ -1393,13 +1433,14 @@ async def pay_pack_inr(call: CallbackQuery):
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Top Up INR",
+                            text="🇮🇳 Top Up INR",
                             callback_data="topup:upi",
+                            style="success",
                         )
                     ],
                     [
                         InlineKeyboardButton(
-                            text="Back",
+                            text="⬅️ Back",
                             callback_data=f"pack:view:{pack_id}",
                         )
                     ],
@@ -1591,16 +1632,7 @@ async def upi_amount(message: Message, state: FSMContext):
         f"Amount: ₹{money(amount)}\n"
         f"UPI ID: <code>{safe_text(UPI_ID)}</code>\n\n"
         "Complete the payment and send the payment screenshot.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Cancel",
-                        callback_data="flow:cancel",
-                    )
-                ]
-            ]
-        ),
+        reply_markup=cancel_keyboard(),
     )
 
 
@@ -1630,12 +1662,14 @@ async def upi_proof(message: Message, state: FSMContext):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Approve",
+                    text="✅ Approve",
                     callback_data=f"payment:approve:{payment_id}",
+                    style="success",
                 ),
                 InlineKeyboardButton(
-                    text="Reject",
+                    text="❌ Reject",
                     callback_data=f"payment:reject:{payment_id}",
+                    style="danger",
                 ),
             ]
         ]
@@ -1924,13 +1958,14 @@ async def crypto_amount(message: Message, state: FSMContext):
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Pay Now",
+                            text="💳 Pay Now",
                             url=payment_url,
+                            style="success",
                         )
                     ],
                     [
                         InlineKeyboardButton(
-                            text="Main Menu",
+                            text="⬅️ Main Menu",
                             callback_data="menu:main",
                         )
                     ],
@@ -2313,14 +2348,12 @@ async def show_purchases(user_id: int, target: Message):
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=purchase.get(
-                        "pack_name",
-                        purchase["pack_id"],
-                    )[:30],
+                    text=f"📦 {purchase.get('pack_name', purchase['pack_id'])[:30]}",
                     callback_data=(
                         f"purchase:view:"
                         f"{purchase['purchase_id']}"
                     ),
+                    style="primary",
                 )
             ]
         )
@@ -2328,7 +2361,7 @@ async def show_purchases(user_id: int, target: Message):
     rows.append(
         [
             InlineKeyboardButton(
-                text="Back",
+                text="⬅️ Back",
                 callback_data="menu:main",
             )
         ]
@@ -2466,12 +2499,14 @@ async def appointment_description(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Confirm",
+                        text="✅ Confirm",
                         callback_data="appointment:confirm",
+                        style="success",
                     ),
                     InlineKeyboardButton(
-                        text="Cancel",
+                        text="❌ Cancel",
                         callback_data="flow:cancel",
+                        style="danger",
                     ),
                 ]
             ]
@@ -2528,27 +2563,30 @@ async def appointment_confirm(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Accept",
+                        text="✅ Accept",
                         callback_data=(
                             f"appointment:accept:"
                             f"{appointment_number}"
                         ),
+                        style="success",
                     ),
                     InlineKeyboardButton(
-                        text="Reject",
+                        text="❌ Reject",
                         callback_data=(
                             f"appointment:reject:"
                             f"{appointment_number}"
                         ),
+                        style="danger",
                     ),
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Contact User",
+                        text="💬 Contact User",
                         callback_data=(
                             f"appointment:contact:"
                             f"{appointment_number}"
                         ),
+                        style="primary",
                     )
                 ],
             ]
@@ -2690,11 +2728,12 @@ async def support_message(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Reply",
+                    text="↩️ Reply",
                     callback_data=(
                         f"support:reply:"
                         f"{message.from_user.id}"
                     ),
+                    style="primary",
                 )
             ]
         ]
@@ -3403,18 +3442,21 @@ async def show_pack_preview(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Save Pack",
+                        text="💾 Save Pack",
                         callback_data="pack:save",
+                        style="success",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Edit",
+                        text="✏️ Edit",
                         callback_data="pack:edit",
+                        style="primary",
                     ),
                     InlineKeyboardButton(
-                        text="Cancel",
+                        text="❌ Cancel",
                         callback_data="flow:cancel",
+                        style="danger",
                     ),
                 ],
             ]
@@ -3536,22 +3578,25 @@ async def show_admin_packs(message: Message, page: int):
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="View",
+                    text="👁️ View",
                     callback_data=(
                         f"adminpack:view:{pack['pack_id']}"
                     ),
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Toggle",
+                    text="🔄 Toggle",
                     callback_data=(
                         f"adminpack:toggle:{pack['pack_id']}"
                     ),
+                    style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="Delete",
+                    text="🗑️ Delete",
                     callback_data=(
                         f"adminpack:delete:{pack['pack_id']}"
                     ),
+                    style="danger",
                 ),
             ]
         )
@@ -3561,14 +3606,14 @@ async def show_admin_packs(message: Message, page: int):
     if page > 1:
         nav.append(
             InlineKeyboardButton(
-                text="Previous",
+                text="⬅️ Previous",
                 callback_data=f"adminpacks:page:{page - 1}",
             )
         )
 
     nav.append(
         InlineKeyboardButton(
-            text=f"Page {page}/{pages}",
+            text=f"📄 Page {page}/{pages}",
             callback_data="noop",
         )
     )
@@ -3576,7 +3621,7 @@ async def show_admin_packs(message: Message, page: int):
     if page < pages:
         nav.append(
             InlineKeyboardButton(
-                text="Next",
+                text="Next ➡️",
                 callback_data=f"adminpacks:page:{page + 1}",
             )
         )
@@ -3585,7 +3630,7 @@ async def show_admin_packs(message: Message, page: int):
     rows.append(
         [
             InlineKeyboardButton(
-                text="Back",
+                text="⬅️ Back",
                 callback_data="admin:panel",
             )
         ]
@@ -3646,7 +3691,7 @@ async def admin_pack_view(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data="admin:packs",
                     )
                 ]
@@ -3701,15 +3746,16 @@ async def admin_pack_delete_confirm(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Confirm Delete",
+                        text="🗑️ Confirm Delete",
                         callback_data=(
                             f"adminpack:deleteconfirm:{pack_id}"
                         ),
+                        style="danger",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Cancel",
+                        text="⬅️ Back",
                         callback_data="admin:packs",
                     )
                 ],
@@ -3778,13 +3824,14 @@ async def admin_users(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Add / Remove Balance",
+                        text="⚖️ Add / Remove Balance",
                         callback_data="admin:userbalance",
+                        style="primary",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data="admin:panel",
                     )
                 ],
@@ -3838,19 +3885,26 @@ async def admin_balance_user(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="INR",
+                        text="🇮🇳 INR",
                         callback_data="balancecur:inr",
+                        style="primary",
                     ),
                     InlineKeyboardButton(
-                        text="USDT",
+                        text="💵 USDT",
                         callback_data="balancecur:usdt",
+                        style="primary",
                     ),
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Cancel",
+                        text="⬅️ Back",
+                        callback_data="admin:panel",
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Cancel",
                         callback_data="flow:cancel",
-                    )
+                        style="danger",
+                    ),
                 ],
             ]
         ),
@@ -4003,7 +4057,7 @@ async def admin_payments(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data="admin:panel",
                     )
                 ]
@@ -4051,7 +4105,7 @@ async def admin_appointments(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Back",
+                        text="⬅️ Back",
                         callback_data="admin:panel",
                     )
                 ]
